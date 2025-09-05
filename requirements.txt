@@ -1,0 +1,4 @@
+minimalmodbus==2.1.1
+pyserial==3.5
+psycopg2==2.9.9
+pydantic==2.9.2
