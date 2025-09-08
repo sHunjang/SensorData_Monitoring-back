@@ -1,23 +1,29 @@
-"""
-collector(1분 주기 DB 저장) + realtime_monitor(5초 주기 실시간 전력계산)
-두 개를 병렬로 실행
-"""
-import multiprocessing
-from src.ingest.collector import main as collector_main
-from src.ingest.realtime_monitor import main as monitor_main
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from src.api.modbus_router import router as modbus_router
+from src.api.temp_router import router as temp_router
+from src.api.humidity_router import router as humidity_router
+from src.api.solar_router import router as solar_router
+from src.common.logging_config import setup_logging
+from src.config.settings import get_allowed_origins
 
-def run_collector():
-    collector_main()
+setup_logging()
+app = FastAPI(title="Sensor Data API")
 
-def run_monitor():
-    monitor_main()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_allowed_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-if __name__ == "__main__":
-    p1 = multiprocessing.Process(target=run_collector)
-    p2 = multiprocessing.Process(target=run_monitor)
+# 라우터 등록
+app.include_router(modbus_router, prefix="/data")
+# app.include_router(temp_router, prefix="/data")
+# app.include_router(humidity_router, prefix="/data")
+# app.include_router(solar_router, prefix="/data")
 
-    p1.start()
-    p2.start()
-
-    p1.join()
-    p2.join()
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}

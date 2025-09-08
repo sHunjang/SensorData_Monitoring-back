@@ -1,53 +1,52 @@
 """
-TAC4300CT 요약값 수집 (Function Code 03, Integer format).
-- 평균 전압, 전류 합, 전체 P/Q/S, PF, 누적 에너지(Active/Reactive/Apparent)
-- 32bit 조합은 High Word 먼저, 그 다음 Low Word.
+TAC4300CT 전력계(Modbus RTU, FC=03) 데이터 읽기
+- 평균 전압, 전류합, 전체 유효/무효/피상 전력, 역률, 에너지
 """
 import minimalmodbus, serial
 from typing import Dict
-from src.config.settings import settings
 
-# ---- 저수준 레지스터 읽기 도우미 ----
-def _read_u32(inst: minimalmodbus.Instrument, addr: int) -> int:
+def create_instrument(port: str = "COM3", slave_id: int = 11):
+    """
+    Modbus RTU 통신용 Instrument 객체 생성
+    - port: COM 포트
+    - slave_id: 장치 주소 (TAC4300CT 메뉴얼 기본은 11)
+    """
+    inst = minimalmodbus.Instrument(port, slave_id)
+    inst.serial.baudrate = 9600
+    inst.serial.bytesize = 8
+    inst.serial.parity = serial.PARITY_NONE
+    inst.serial.stopbits = 1
+    inst.serial.timeout = 1
+    inst.clear_buffers_before_each_transaction = True
+    return inst
+
+def _read_u32(inst, addr: int) -> int:
+    """32비트 Unsigned 값 읽기 (High Word 먼저)"""
     hi, lo = inst.read_registers(addr, 2, functioncode=3)
     return (hi << 16) | lo
 
-def _read_s32(inst: minimalmodbus.Instrument, addr: int) -> int:
+def _read_s32(inst, addr: int) -> int:
+    """32비트 Signed 값 읽기"""
     raw = _read_u32(inst, addr)
     return raw - 0x100000000 if (raw & 0x80000000) else raw
 
-def _read_s16(inst: minimalmodbus.Instrument, addr: int) -> int:
+def _read_s16(inst, addr: int) -> int:
+    """16비트 Signed 값 읽기"""
     return inst.read_register(addr, 0, functioncode=3, signed=True)
 
-# ---- 계측기 초기화 ----
-def create_instrument() -> minimalmodbus.Instrument:
-    s = settings.serial
-    inst = minimalmodbus.Instrument(s.port, s.slave_id)
-    inst.serial.baudrate = s.baudrate
-    inst.serial.bytesize = 8
-    inst.serial.parity   = {
-        "N": serial.PARITY_NONE,
-        "E": serial.PARITY_EVEN,
-        "O": serial.PARITY_ODD,
-    }.get(s.parity.upper(), serial.PARITY_NONE)
-    inst.serial.stopbits = s.stopbits
-    inst.serial.timeout  = s.timeout_s
-    inst.clear_buffers_before_each_transaction = True  # 노이즈 회피
-    return inst
-
-# ---- 요약값 읽기 ----
-def read_summary(inst: minimalmodbus.Instrument) -> Dict[str, float]:
+def read_summary(inst) -> Dict[str, float]:
     """
-    레지스터 매핑 (FC=03):
-      0x0036 평균전압×0.01V (U32)
-      0x0034 전류합×0.001A (U32)
-      0x002C 전체유효P×0.001kW (S32)
-      0x002E 전체무효Q×0.001kvar (S32)
-      0x0030 전체피상S×0.001kVA (U32)
-      0x0032 전체PF×0.001 (S16)
-      0x0404 전체Active E×0.01kWh (S32)
-      0x040C 전체Reactive E×0.01kvarh (S32)
-      0x0410 전체Apparent E×0.01kVAh (U32)
+    요약 데이터 읽기
+    레지스터 매핑:
+    - 0x0036 평균전압×0.01V
+    - 0x0034 전류합×0.001A
+    - 0x002C 전체유효전력×0.001kW
+    - 0x002E 전체무효전력×0.001kvar
+    - 0x0030 전체피상전력×0.001kVA
+    - 0x0032 전체역률×0.001
+    - 0x0404 전체Active에너지×0.01kWh
+    - 0x040C 전체Reactive에너지×0.01kvarh
+    - 0x0410 전체Apparent에너지×0.01kVAh
     """
     v_avg = _read_u32(inst, 0x0036) * 0.01
     i_sum = _read_u32(inst, 0x0034) * 0.001
@@ -60,13 +59,13 @@ def read_summary(inst: minimalmodbus.Instrument) -> Dict[str, float]:
     e_app = _read_u32(inst, 0x0410) * 0.01
 
     return {
-        "avg_voltage_V": v_avg,
-        "sum_current_A": i_sum,
-        "total_active_kW": p_tot,
-        "total_reactive_kvar": q_tot,
-        "total_apparent_kVA": s_tot,
-        "total_power_factor": pf,
-        "total_active_energy_kWh": e_act,
-        "total_reactive_energy_kvarh": e_rea,
-        "total_apparent_energy_kVAh": e_app,
+        "avg_voltage_V": round(v_avg,2),
+        "sum_current_A": round(i_sum,2),
+        "total_active_kW": round(p_tot,2),
+        "total_reactive_kvar": round(q_tot,2),
+        "total_apparent_kVA": round(s_tot,2),
+        "total_power_factor": round(pf,3),
+        "total_active_energy_kWh": round(e_act,2),
+        "total_reactive_energy_kvarh": round(e_rea,2),
+        "total_apparent_energy_kVAh": round(e_app,2),
     }
