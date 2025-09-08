@@ -1,28 +1,22 @@
 """
-PostgreSQL 연결 관리
+PostgreSQL 커넥션 헬퍼
+- 매 쿼리마다 커넥션을 짧게 열고 닫아 단순화
+- 컨텍스트 매니저 get_cursor() 사용
 """
-
 import psycopg2
 from contextlib import contextmanager
 from src.config.settings import settings
 
-def get_connection():
-    return psycopg2.connect(settings.pg_dsn)
-
-
 @contextmanager
 def get_cursor():
-    conn = get_connection()
-    
+    conn = psycopg2.connect(settings.pg_dsn)
     try:
         cur = conn.cursor()
         yield cur
         conn.commit()
-    
-    except Exception:
-        conn.rollback()
-        raise
-
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except Exception:
+            pass
         conn.close()
