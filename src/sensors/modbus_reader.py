@@ -65,7 +65,7 @@ def read_summary(inst) -> Dict[str, float]:
         "total_reactive_kvar": round(q_tot,2),
         "total_apparent_kVA": round(s_tot,2),
         "total_power_factor": round(pf,3),
-        "total_active_energy_kWh": round(e_act,2),
+        "total_active_energy_kwh": round(e_act,2),
         "total_reactive_energy_kvarh": round(e_rea,2),
         "total_apparent_energy_kVAh": round(e_app,2),
     }

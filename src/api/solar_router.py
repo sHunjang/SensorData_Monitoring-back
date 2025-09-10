@@ -11,6 +11,8 @@ from src.services.modbus_service import resolve_window, choose_bucket_seconds, s
 
 router = APIRouter(prefix="/data/solar", tags=["solar"])
 
+# =============================================================================================================
+
 def _query_solar(bucket: str, s: datetime, e: datetime) -> List[Dict]:
     sql = """
         SELECT time_bucket(%s, ts) AS bucket, avg(value) AS solar
@@ -27,6 +29,8 @@ def _query_solar(bucket: str, s: datetime, e: datetime) -> List[Dict]:
         out.append({"bucket": bucket_dt.isoformat(), "solar": round(float(val), 2) if val is not None else None})
     return out
 
+# =============================================================================================================
+
 def _compute_stats(rows: List[Dict]) -> Dict[str, Dict]:
     vals = [float(r["solar"]) for r in rows if r.get("solar") is not None]
     if not vals:
@@ -39,6 +43,8 @@ def _compute_stats(rows: List[Dict]) -> Dict[str, Dict]:
             "count": len(vals),
         }
     }
+
+# =============================================================================================================
 
 @router.get("/query")
 def solar_query(
@@ -65,4 +71,21 @@ def solar_query(
         "series": ["solar"],
         "data": data,
         "stats": stats,
+    }
+    
+# =============================================================================================================
+
+@router.get("/latest")
+def solar_latest():
+    """
+    일사량 최근 1건 반환.
+    - { solar, ts }
+    """
+    with get_cursor() as cur:
+        cur.execute("SELECT ts, value FROM solar_data ORDER BY ts DESC LIMIT 1")
+        r = cur.fetchone()
+
+    return {
+        "solar": float(r[1]) if r and r[1] is not None else None,
+        "ts": r[0].isoformat() if r else None,
     }

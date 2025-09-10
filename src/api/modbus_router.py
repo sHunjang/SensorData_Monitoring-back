@@ -13,7 +13,7 @@ from src.services.modbus_service import (
 
 router = APIRouter(prefix="/data/modbus", tags=["modbus"])
 
-router = APIRouter(prefix="/data/modbus", tags=["modbus"])
+# =============================================================================================================
 
 def _has_column(table: str, col: str) -> bool:
     sql = """
@@ -26,10 +26,12 @@ def _has_column(table: str, col: str) -> bool:
         cur.execute(sql, (table, col))
         return cur.fetchone() is not None
 
+# =============================================================================================================
+
 def _build_raw_columns() -> str:
     base = [
-        "time_stamp", "device_id",
-        # 역률 컬럼은 동적으로 삽입
+        "time_stamp",
+        "device_id",
         "total_active_power_kW",
         "total_reactive_power_kvar",
         "total_apparent_power_kVA",
@@ -37,15 +39,13 @@ def _build_raw_columns() -> str:
         "avg_line_to_neutral_volts_V",
         "avg_line_to_line_volts_V",
         "avg_line_current_A",
-        "total_active_energy_kWh",
+        "total_active_energy_kwh",
         "total_reactive_energy_kvarh",
         "total_apparent_energy_kVAh",
     ]
     # power_factor 계열 존재 확인
     pf_col = None
-    if _has_column("modbus_data", "total_power_factor"):
-        pf_col = "total_power_factor"
-    elif _has_column("modbus_data", "avg_power_factor"):
+    if _has_column("modbus_data", "avg_power_factor"):
         pf_col = "avg_power_factor"
 
     if pf_col:
@@ -53,11 +53,68 @@ def _build_raw_columns() -> str:
 
     return ", ".join(base)
 
+# =============================================================================================================
+
+def _energy_column() -> str | None:
+    """에너지 컬럼 존재 확인 코드. 없으면 None"""
+    for c in ("total_active_energy_kwh", "active_energy_kWh"):
+        if _has_column("modbus_data", c):
+            return c
+    return None
+
+# =============================================================================================================
+
+@router.get("/energy_today")
+def get_energy_today(device_id: int = Query(..., description="슬레이브 ID(11~15)")):
+    """
+    당일(서버 현지 기준) 00:00 이후 전력량 증가분(kWh).
+    - e = 마지막 값 - 첫 값
+    """
+    energy_col = _energy_column()
+    if not energy_col:
+        return {"device_id": device_id, "kwh": None}
+
+    with get_cursor() as cur:
+        # 자정 시각
+        cur.execute("SELECT date_trunc('day', now())")
+        start_of_day = cur.fetchone()[0]
+
+        # 첫 값
+        cur.execute(f"""
+            SELECT time_stamp, {energy_col}
+            FROM modbus_data
+            WHERE device_id=%s AND time_stamp >= %s
+            ORDER BY time_stamp ASC LIMIT 1
+        """, (device_id, start_of_day))
+        first = cur.fetchone()
+
+        # 마지막 값
+        cur.execute(f"""
+            SELECT time_stamp, {energy_col}
+            FROM modbus_data
+            WHERE device_id=%s AND time_stamp >= %s
+            ORDER BY time_stamp DESC LIMIT 1
+        """, (device_id, start_of_day))
+        last = cur.fetchone()
+
+    if not first or not last or first[1] is None or last[1] is None:
+        return {"device_id": device_id, "kwh": None}
+
+    kwh = float(last[1]) - float(first[1])
+    return {
+        "device_id": device_id,
+        "kwh": round(kwh, 2),
+        "first_ts": first[0].isoformat(),
+        "last_ts": last[0].isoformat(),
+    }
+
+# =============================================================================================================
+
 @router.get("/realtime")
 def get_realtime(device_id: int = Query(..., description="슬레이브 ID(11~15)")):
     """
     특정 장치 최신 Raw 1건
-    - 존재하는 역률 컬럼만 선택(없으면 미포함)
+    - 존재하는 역률 컬럼만 선택
     - voltage 필드는 구성에 맞는 전압(avg L-L or L-N)으로 통일
     """
     raw_cols = _build_raw_columns()
@@ -82,11 +139,13 @@ def get_realtime(device_id: int = Query(..., description="슬레이브 ID(11~15)
     out["phase_config"] = "3P3W" if device_id in THREE_WIRE_IDS else "3P4W"
     return out
 
+# =============================================================================================================
+
 @router.get("/query")
 def get_query(
     device_id: int,
-    # 시리즈 키 선택: p_total, q_total, s_total, pf_total, voltage, current
-    series: Optional[List[str]] = Query(default=["p_total", "voltage", "current"]),
+    # series 키는 풀네임 기준
+    series: Optional[List[str]] = Query(default=["total_active_power_kW", "voltage", "sum_line_currents_A"]),
     preset: Optional[str] = Query(default="1d", description="15m|1h|1d|1w|1mo"),
     start: Optional[str] = None,
     end: Optional[str] = None,
@@ -99,7 +158,7 @@ def get_query(
     """
     result = query_modbus_window(
         device_id=device_id,
-        series_keys=series or ["p_total"],
+        series_keys=series or ["total_active_power_kW"],
         preset=preset,
         start=start,
         end=end,

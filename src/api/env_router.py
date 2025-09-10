@@ -11,6 +11,8 @@ from src.services.modbus_service import resolve_window, choose_bucket_seconds, s
 
 router = APIRouter(prefix="/data/env", tags=["environment"])
 
+# =============================================================================================================
+
 def _query_series(table: str, key: str, bucket: str, s: datetime, e: datetime) -> List[Dict]:
     sql = f"""
         SELECT time_bucket(%s, ts) AS bucket, avg(value) AS {key}
@@ -30,6 +32,8 @@ def _query_series(table: str, key: str, bucket: str, s: datetime, e: datetime) -
         })
     return out
 
+# =============================================================================================================
+
 def _merge_by_bucket(temp_rows: List[Dict], hum_rows: List[Dict]) -> List[Dict]:
     m: Dict[str, Dict] = {}
     for r in temp_rows:
@@ -39,6 +43,8 @@ def _merge_by_bucket(temp_rows: List[Dict], hum_rows: List[Dict]) -> List[Dict]:
         b = r["bucket"]
         m.setdefault(b, {"bucket": b}).update(r)
     return [m[k] for k in sorted(m.keys())]
+
+# =============================================================================================================
 
 def _compute_stats(rows: List[Dict], keys: List[str]) -> Dict[str, Dict]:
     stats: Dict[str, Dict] = {}
@@ -53,6 +59,8 @@ def _compute_stats(rows: List[Dict], keys: List[str]) -> Dict[str, Dict]:
             } if vals else {"avg": None, "max": None, "min": None, "count": 0}
         )
     return stats
+
+# =============================================================================================================
 
 @router.get("/query")
 def env_query(
@@ -82,4 +90,24 @@ def env_query(
         "series": ["temperature", "humidity"],
         "data": merged,
         "stats": stats,
+    }
+    
+# =============================================================================================================
+
+@router.get("/latest")
+def env_latest():
+    """
+    온도/습도 최근 1건씩 반환
+    """
+    with get_cursor() as cur:
+        cur.execute("SELECT ts, value FROM temp_data ORDER BY ts DESC LIMIT 1")
+        t = cur.fetchone()
+        cur.execute("SELECT ts, value FROM humidity_data ORDER BY ts DESC LIMIT 1")
+        h = cur.fetchone()
+
+    return {
+        "temperature": float(t[1]) if t and t[1] is not None else None,
+        "humidity": float(h[1]) if h and h[1] is not None else None,
+        "ts_temperature": t[0].isoformat() if t else None,
+        "ts_humidity": h[0].isoformat() if h else None,
     }
