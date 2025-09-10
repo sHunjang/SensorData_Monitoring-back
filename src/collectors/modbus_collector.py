@@ -13,16 +13,15 @@ def ensure_table():
                 time_stamp TIMESTAMPTZ NOT NULL,
                 device_id INT NOT NULL,
                 -- avg_power_factor DOUBLE PRECISION,
-                -- total_active_power_kW DOUBLE PRECISION,
+                -- total_active_power_kw DOUBLE PRECISION,
                 -- total_reactive_power_kvar DOUBLE PRECISION,
-                -- total_apparent_power_kVA DOUBLE PRECISION,
-                -- sum_line_currents_A DOUBLE PRECISION,
-                -- avg_line_to_neutral_volts_V DOUBLE PRECISION,
-                -- avg_line_to_line_volts_V DOUBLE PRECISION,
-                -- avg_line_current_A DOUBLE PRECISION,
+                -- total_apparent_power_kva DOUBLE PRECISION,
+                -- sum_line_currents_a DOUBLE PRECISION,
+                -- avg_line_to_neutral_volts_v DOUBLE PRECISION,
+                -- avg_line_to_line_volts_v DOUBLE PRECISION,
                 total_active_energy_kwh DOUBLE PRECISION,
                 total_reactive_energy_kvarh DOUBLE PRECISION,
-                total_apparent_energy_kVAh DOUBLE PRECISION
+                total_apparent_energy_kvah DOUBLE PRECISION
             );
         """)
 
@@ -31,13 +30,13 @@ def insert_row(device_id: int, row: dict):
         cur.execute("""
             INSERT INTO modbus_data
             (time_stamp, device_id,
-             total_active_energy_kwh, total_reactive_energy_kvarh, total_apparent_energy_kVAh)
+             total_active_energy_kwh, total_reactive_energy_kvarh, total_apparent_energy_kvah)
             VALUES (NOW(), %s,%s,%s,%s)
         """, (
             device_id,
             row["total_active_energy_kwh"],
             row["total_reactive_energy_kvarh"],
-            row["total_apparent_energy_kVAh"]
+            row["total_apparent_energy_kvah"]
         ))
 
 def read_u32_scaled(client, unit_id, address, scale=1.0, signed=False):
@@ -65,7 +64,7 @@ def main():
     ADDR_EN = {
         "total_active_energy_kwh": 0x0404,      # LONG ×0.01
         "total_reactive_energy_kvarh": 0x040C,  # LONG ×0.01
-        "total_apparent_energy_kVAh": 0x0410,   # ULONG ×0.01
+        "total_apparent_energy_kvah": 0x0410,   # ULONG ×0.01
     }
 
     while True:
@@ -74,11 +73,11 @@ def main():
                 row = {
                     "total_active_energy_kwh": read_u32_scaled(client, sid, ADDR_EN["total_active_energy_kwh"], 0.01, signed=True),
                     "total_reactive_energy_kvarh": read_u32_scaled(client, sid, ADDR_EN["total_reactive_energy_kvarh"], 0.01, signed=True),
-                    "total_apparent_energy_kVAh": read_u32_scaled(client, sid, ADDR_EN["total_apparent_energy_kVAh"], 0.01),
+                    "total_apparent_energy_kvah": read_u32_scaled(client, sid, ADDR_EN["total_apparent_energy_kvah"], 0.01),
                 }
                 insert_row(sid, row)
                 log.info("sid=%d E=%.2f kWh, Q=%.2f kvarh, S=%.2f kVAh",
-                         sid, row["total_active_energy_kwh"], row["total_reactive_energy_kvarh"], row["total_apparent_energy_kVAh"])
+                         sid, row["total_active_energy_kwh"], row["total_reactive_energy_kvarh"], row["total_apparent_energy_kvah"])
             except Exception as e:
                 log.warning("sid=%d error: %s", sid, e)
 

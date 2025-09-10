@@ -5,13 +5,18 @@ FastAPI 앱 시작점
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import threading
 
 from src.api import modbus_router, env_router, solar_router
 from src.common.logging_config import setup_logging
 
-# collector 실행용
-import threading
-from src.ingest import modbus_collector
+# 실제 Collector 파일 실행
+from src.collectors import modbus_collector, solar_collector, env_collector
+
+# 더미 데이터 Collector 파일 실행
+from src.collectors import dummy_env_collector, dummy_modbus_collector, dummy_solar_collector
+
+
 
 app = FastAPI()
 setup_logging()
@@ -35,17 +40,34 @@ app.include_router(modbus_router.router)
 app.include_router(env_router.router)
 app.include_router(solar_router.router)
 
-@app.on_event("startup")
-def startup_event():
-    """
-    서버 시작 시 Modbus Collector를 백그라운드 스레드로 실행
-    """
-    def run_collector():
-        try:
-            modbus_collector.main()
-        except Exception as e:
-            import logging
-            logging.getLogger("collector").error(f"Collector crashed: {e}")
 
-    thread = threading.Thread(target=run_collector, daemon=True)
-    thread.start()
+
+# @app.on_event("startup")
+# def startup_event():
+#     """
+#     서버 시작 시 Modbus Collector를 백그라운드 스레드로 실행
+#     """
+#     def run_collector():
+#         try:
+#             modbus_collector.main()
+#         except Exception as e:
+#             import logging
+#             logging.getLogger("collector").error(f"Collector crashed: {e}")
+
+#     thread = threading.Thread(target=run_collector, daemon=True)
+#     thread.start()
+
+
+# ✅ 서버 시작 시 더미 collectors 실행 (스레드 기반)
+@app.on_event("startup")
+def start_dummy_collectors():
+    def run_env():
+        dummy_env_collector.run_collector(interval=5)
+    def run_modbus():
+        dummy_modbus_collector.run_collector(interval=5)
+    def run_solar():
+        dummy_solar_collector.run_collector(interval=5)
+
+    threading.Thread(target=run_env, daemon=True).start()
+    threading.Thread(target=run_modbus, daemon=True).start()
+    threading.Thread(target=run_solar, daemon=True).start()

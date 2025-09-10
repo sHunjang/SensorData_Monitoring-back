@@ -1,167 +1,52 @@
 """
-modbus_data 조회 API
-- /realtime: 장치 최신 1건(raw)
-- /query: 기간 집계 + 통계 + 버킷 정보
-- 장치 5대(11~15) 및 3상3선/4선 전압 분기 반영
+modbus_router.py
+- 전력량계 API 라우터
 """
+
 from fastapi import APIRouter, Query
 from typing import Optional, List
-from src.db.client import get_cursor
 from src.services.modbus_service import (
-    query_modbus_window, THREE_WIRE_IDS, FOUR_WIRE_IDS, resolve_voltage_col
+    query_modbus_window,
+    query_modbus_realtime,
+    resolve_voltage_col,
+    normalize_series
 )
 
 router = APIRouter(prefix="/data/modbus", tags=["modbus"])
 
-# =============================================================================================================
-
-def _has_column(table: str, col: str) -> bool:
-    sql = """
-      SELECT 1
-      FROM information_schema.columns
-      WHERE table_name = %s AND column_name = %s
-      LIMIT 1
-    """
-    with get_cursor() as cur:
-        cur.execute(sql, (table, col))
-        return cur.fetchone() is not None
-
-# =============================================================================================================
-
-def _build_raw_columns() -> str:
-    base = [
-        "time_stamp",
-        "device_id",
-        "total_active_power_kW",
-        "total_reactive_power_kvar",
-        "total_apparent_power_kVA",
-        "sum_line_currents_A",
-        "avg_line_to_neutral_volts_V",
-        "avg_line_to_line_volts_V",
-        "avg_line_current_A",
-        "total_active_energy_kwh",
-        "total_reactive_energy_kvarh",
-        "total_apparent_energy_kVAh",
-    ]
-    # power_factor 계열 존재 확인
-    pf_col = None
-    if _has_column("modbus_data", "avg_power_factor"):
-        pf_col = "avg_power_factor"
-
-    if pf_col:
-        base.insert(2, pf_col)  # time_stamp, device_id 다음에 삽입
-
-    return ", ".join(base)
-
-# =============================================================================================================
-
-def _energy_column() -> str | None:
-    """에너지 컬럼 존재 확인 코드. 없으면 None"""
-    for c in ("total_active_energy_kwh", "active_energy_kWh"):
-        if _has_column("modbus_data", c):
-            return c
-    return None
-
-# =============================================================================================================
-
-@router.get("/energy_today")
-def get_energy_today(device_id: int = Query(..., description="슬레이브 ID(11~15)")):
-    """
-    당일(서버 현지 기준) 00:00 이후 전력량 증가분(kWh).
-    - e = 마지막 값 - 첫 값
-    """
-    energy_col = _energy_column()
-    if not energy_col:
-        return {"device_id": device_id, "kwh": None}
-
-    with get_cursor() as cur:
-        # 자정 시각
-        cur.execute("SELECT date_trunc('day', now())")
-        start_of_day = cur.fetchone()[0]
-
-        # 첫 값
-        cur.execute(f"""
-            SELECT time_stamp, {energy_col}
-            FROM modbus_data
-            WHERE device_id=%s AND time_stamp >= %s
-            ORDER BY time_stamp ASC LIMIT 1
-        """, (device_id, start_of_day))
-        first = cur.fetchone()
-
-        # 마지막 값
-        cur.execute(f"""
-            SELECT time_stamp, {energy_col}
-            FROM modbus_data
-            WHERE device_id=%s AND time_stamp >= %s
-            ORDER BY time_stamp DESC LIMIT 1
-        """, (device_id, start_of_day))
-        last = cur.fetchone()
-
-    if not first or not last or first[1] is None or last[1] is None:
-        return {"device_id": device_id, "kwh": None}
-
-    kwh = float(last[1]) - float(first[1])
-    return {
-        "device_id": device_id,
-        "kwh": round(kwh, 2),
-        "first_ts": first[0].isoformat(),
-        "last_ts": last[0].isoformat(),
-    }
-
-# =============================================================================================================
-
 @router.get("/realtime")
-def get_realtime(device_id: int = Query(..., description="슬레이브 ID(11~15)")):
+def get_realtime(device_id: int = Query(..., description="장치 ID")):
     """
-    특정 장치 최신 Raw 1건
-    - 존재하는 역률 컬럼만 선택
-    - voltage 필드는 구성에 맞는 전압(avg L-L or L-N)으로 통일
+    전력량계 실시간 값 조회 (가장 최근 row)
     """
-    raw_cols = _build_raw_columns()
-    with get_cursor() as cur:
-        cur.execute(f"""
-            SELECT {raw_cols}
-            FROM modbus_data
-            WHERE device_id = %s
-            ORDER BY time_stamp DESC
-            LIMIT 1
-        """, (device_id,))
-        row = cur.fetchone()
-        if not row:
-            return {"error": "데이터 없음"}
-
-        cols = [d[0] for d in cur.description]
-        out = dict(zip(cols, row))
-
-    # 전압 통일 필드
-    v_col = resolve_voltage_col(device_id)
-    out["voltage"] = out.get(v_col)
-    out["phase_config"] = "3P3W" if device_id in THREE_WIRE_IDS else "3P4W"
-    return out
-
-# =============================================================================================================
+    return query_modbus_realtime(device_id)
 
 @router.get("/query")
 def get_query(
-    device_id: int,
-    # series 키는 풀네임 기준
-    series: Optional[List[str]] = Query(default=["total_active_power_kW", "voltage", "sum_line_currents_A"]),
-    preset: Optional[str] = Query(default="1d", description="15m|1h|1d|1w|1mo"),
+    device_id: int = Query(..., description="장치 ID"),
+    series: Optional[List[str]] = Query(default=None, description="조회할 컬럼 시리즈"),
+    preset: Optional[str] = Query(default="1h", description="15m|1h|1d|1w|1mo"),
     start: Optional[str] = None,
     end: Optional[str] = None,
-    max_points: Optional[int] = Query(default=500, ge=50, le=5000),
 ):
     """
-    기간 집계 + 통계 반환
-    - 서버가 bucket_seconds로 포인트 수를 제어
-    - 통계: 평균/최대/최소/개수(stats.*)
+    전력량계 기간별 집계 조회
+    - series 파라미터 없으면 기본값: [power, current, voltage]
+    - 프론트에서 간단 키(voltage, current, power, energy)를 보내면
+      DB 실제 컬럼명으로 변환됨
     """
-    result = query_modbus_window(
+    if not series:
+        # 기본 시리즈 = 유효전력, 전류합, 전압
+        v_col = resolve_voltage_col(device_id)
+        series = ["total_active_power_kW", "sum_line_currents_A", v_col]
+    else:
+        # 프론트 요청 키를 DB 실제 컬럼명으로 변환
+        series = normalize_series(device_id, series)
+
+    return query_modbus_window(
         device_id=device_id,
-        series_keys=series or ["total_active_power_kW"],
+        series=series,
         preset=preset,
         start=start,
         end=end,
-        max_points=max_points or 500,
     )
-    return result
