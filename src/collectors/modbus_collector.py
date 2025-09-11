@@ -1,89 +1,74 @@
-import time
-import logging
-from pymodbus.client import ModbusSerialClient
-from src.common.logging_config import setup_logging
-from src.db.client import get_cursor
+"""
+modbus_collector.py
+- reader에서 읽은 데이터를 주기적으로 DB에 저장
+"""
 
-log = logging.getLogger("collector")
+import time, logging
+from src.sensors.modbus_reader import create_instrument, read_summary
+from src.db.client import get_cursor
+from src.common.logging_config import setup_logging
+
+log = logging.getLogger("modbus_collector")
+
+DEVICE_IDS = [11, 12, 13, 14, 15]
 
 def ensure_table():
+    """modbus_data 테이블 생성"""
     with get_cursor() as cur:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS modbus_data (
                 time_stamp TIMESTAMPTZ NOT NULL,
                 device_id INT NOT NULL,
-                -- avg_power_factor DOUBLE PRECISION,
-                -- total_active_power_kw DOUBLE PRECISION,
-                -- total_reactive_power_kvar DOUBLE PRECISION,
-                -- total_apparent_power_kva DOUBLE PRECISION,
-                -- sum_line_currents_a DOUBLE PRECISION,
-                -- avg_line_to_neutral_volts_v DOUBLE PRECISION,
-                -- avg_line_to_line_volts_v DOUBLE PRECISION,
-                total_active_energy_kwh DOUBLE PRECISION,
+                total_active_power_kw DOUBLE PRECISION,
+                total_reactive_power_kvar DOUBLE PRECISION,
+                total_apparent_power_kva DOUBLE PRECISION,
+                total_power_factor DOUBLE PRECISION,
+                sum_line_currents_a DOUBLE PRECISION,
+                avg_line_to_line_volts_v DOUBLE PRECISION,
+                avg_line_to_neutral_volts_v DOUBLE PRECISION,
+                total_active_energy_kWh DOUBLE PRECISION,
                 total_reactive_energy_kvarh DOUBLE PRECISION,
                 total_apparent_energy_kvah DOUBLE PRECISION
             );
         """)
 
 def insert_row(device_id: int, row: dict):
+    """DB에 한 줄 삽입"""
     with get_cursor() as cur:
         cur.execute("""
             INSERT INTO modbus_data
             (time_stamp, device_id,
+             avg_voltage_V, sum_current_A,
+             total_active_kW, total_reactive_kvar, total_apparent_kVA,
+             total_power_factor,
              total_active_energy_kwh, total_reactive_energy_kvarh, total_apparent_energy_kvah)
-            VALUES (NOW(), %s,%s,%s,%s)
+            VALUES (NOW(), %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
             device_id,
-            row["total_active_energy_kwh"],
-            row["total_reactive_energy_kvarh"],
-            row["total_apparent_energy_kvah"]
+            row["avg_voltage_V"], row["sum_current_A"],
+            row["total_active_kW"], row["total_reactive_kvar"], row["total_apparent_kVA"],
+            row["total_power_factor"],
+            row["total_active_energy_kwh"], row["total_reactive_energy_kvarh"], row["total_apparent_energy_kvah"],
         ))
-
-def read_u32_scaled(client, unit_id, address, scale=1.0, signed=False):
-    res = client.read_holding_registers(address=address, count=2, slave=unit_id)
-    if res.isError():
-        raise RuntimeError(res)
-    raw = (res.registers[0] << 16) | res.registers[1]
-    if signed and raw & 0x80000000:
-        raw -= 0x100000000
-    return round(raw * scale, 3)
 
 def main():
     setup_logging()
     ensure_table()
-    log.info("collector start")
-
-    client = ModbusSerialClient(port="COM7", baudrate=9600, bytesize=8,
-                                parity="N", stopbits=1, timeout=1)
-    if not client.connect():
-        log.error("Modbus 연결 실패")
-        return
+    log.info("Modbus collector started.")
 
     device_ids = [11, 12, 13, 14, 15]
-
-    ADDR_EN = {
-        "total_active_energy_kwh": 0x0404,      # LONG ×0.01
-        "total_reactive_energy_kvarh": 0x040C,  # LONG ×0.01
-        "total_apparent_energy_kvah": 0x0410,   # ULONG ×0.01
-    }
 
     while True:
         for sid in device_ids:
             try:
-                row = {
-                    "total_active_energy_kwh": read_u32_scaled(client, sid, ADDR_EN["total_active_energy_kwh"], 0.01, signed=True),
-                    "total_reactive_energy_kvarh": read_u32_scaled(client, sid, ADDR_EN["total_reactive_energy_kvarh"], 0.01, signed=True),
-                    "total_apparent_energy_kvah": read_u32_scaled(client, sid, ADDR_EN["total_apparent_energy_kvah"], 0.01),
-                }
+                inst = create_instrument(slave_id=sid)
+                row = read_summary(inst)
                 insert_row(sid, row)
-                log.info("sid=%d E=%.2f kWh, Q=%.2f kvarh, S=%.2f kVAh",
-                         sid, row["total_active_energy_kwh"], row["total_reactive_energy_kvarh"], row["total_apparent_energy_kvah"])
+                log.info(f"sid={sid} row={row}")
             except Exception as e:
+                # 장치 연결 실패 or 데이터 읽기 실패 -> 로그만 남기고 넘어감
                 log.warning("sid=%d error: %s", sid, e)
-
         time.sleep(60)
-
-    client.close()
 
 if __name__ == "__main__":
     main()

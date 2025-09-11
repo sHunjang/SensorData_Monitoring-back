@@ -62,11 +62,11 @@ app.include_router(solar_router.router)
 @app.on_event("startup")
 def start_dummy_collectors():
     def run_env():
-        dummy_env_collector.run_collector(interval=5)
+        dummy_env_collector.run_collector(interval=10)
     def run_modbus():
-        dummy_modbus_collector.run_collector(interval=5)
+        dummy_modbus_collector.run_collector(interval=10)
     def run_solar():
-        dummy_solar_collector.run_collector(interval=5)
+        dummy_solar_collector.run_collector(interval=10)
 
     threading.Thread(target=run_env, daemon=True).start()
     threading.Thread(target=run_modbus, daemon=True).start()

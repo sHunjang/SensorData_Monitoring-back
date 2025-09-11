@@ -3,6 +3,7 @@ solar_service.py
 - 일사량(solar_data) 조회 및 통계 계산 로직
 """
 
+from fastapi import HTTPException
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 from src.db.client import get_cursor
@@ -26,40 +27,43 @@ def query_solar_window(
     """
     solar_data 테이블에서 지정 기간 일사량을 버킷 단위로 조회
     """
-    s, e = resolve_window(preset, start, end)
-    bucket_str = BUCKET_MAP.get(preset, "1 hour")
+    try:
+        s, e = resolve_window(preset, start, end)
+        bucket_str = BUCKET_MAP.get(preset, "1 hour")
 
-    sql = f"""
-        SELECT time_bucket(%s, time_stamp) AS bucket,
-               avg(value) AS solar
-        FROM solar_data
-        WHERE time_stamp >= %s AND time_stamp <= %s
-        GROUP BY bucket
-        ORDER BY bucket;
-    """
-    params = [bucket_str, s, e]
+        sql = f"""
+            SELECT time_bucket(%s, time_stamp) AS bucket,
+                avg(value) AS solar
+            FROM solar_data
+            WHERE time_stamp >= %s AND time_stamp <= %s
+            GROUP BY bucket
+            ORDER BY bucket;
+        """
+        params = [bucket_str, s, e]
 
-    with get_cursor() as cur:
-        cur.execute(sql, params)
-        rows = cur.fetchall()
+        with get_cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
 
-    data: List[Dict] = []
-    for r in rows:
-        item = {
-            "bucket": r[0].isoformat(),
-            "solar": round(float(r[1]), 2) if r[1] is not None else None,
+        data: List[Dict] = []
+        for r in rows:
+            item = {
+                "bucket": r[0].isoformat(),
+                "solar": round(float(r[1]), 2) if r[1] is not None else None,
+            }
+            data.append(item)
+
+        stats = _compute_stats(data)
+
+        return {
+            "window": {"start": s.isoformat(), "end": e.isoformat()},
+            "bucket": bucket_str,
+            "series": ["solar"],
+            "data": data,
+            "stats": stats,
         }
-        data.append(item)
-
-    stats = _compute_stats(data)
-
-    return {
-        "window": {"start": s.isoformat(), "end": e.isoformat()},
-        "bucket": bucket_str,
-        "series": ["solar"],
-        "data": data,
-        "stats": stats,
-    }
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="센서 연결이 필요합니다.")
 
 def _compute_stats(rows: List[Dict]) -> Dict[str, Dict]:
     vals = [float(r["solar"]) for r in rows if r.get("solar") is not None]

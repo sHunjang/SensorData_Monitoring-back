@@ -1,24 +1,24 @@
 """
-TAC4300CT 전력계(Modbus RTU, FC=03) 데이터 읽기
-- 평균 전압, 전류합, 전체 유효/무효/피상 전력, 역률, 에너지
+modbus_reader.py
+- TAC4300 전력량계(Modbus RTU, FC=03) 레지스터 읽기 전용 모듈
 """
+
 import minimalmodbus, serial
 from typing import Dict
 
-def create_instrument(port: str = "COM3", slave_id: int = 11):
-    """
-    Modbus RTU 통신용 Instrument 객체 생성
-    - port: COM 포트
-    - slave_id: 장치 주소 (TAC4300CT 메뉴얼 기본은 11)
-    """
-    inst = minimalmodbus.Instrument(port, slave_id)
-    inst.serial.baudrate = 9600
-    inst.serial.bytesize = 8
-    inst.serial.parity = serial.PARITY_NONE
-    inst.serial.stopbits = 1
-    inst.serial.timeout = 1
-    inst.clear_buffers_before_each_transaction = True
-    return inst
+def create_instrument(port: str = "COM7", slave_id: int = 11):
+    """Modbus RTU Instrument 객체 생성"""
+    try:
+        inst = minimalmodbus.Instrument(port, slave_id)
+        inst.serial.baudrate = 9600
+        inst.serial.bytesize = 8
+        inst.serial.parity = serial.PARITY_NONE
+        inst.serial.stopbits = 1
+        inst.serial.timeout = 1
+        inst.clear_buffers_before_each_transaction = True
+        return inst
+    except Exception as e:
+        raise ConnectionError(f"포트 {port}에서 장치 조회/초기화 실패: {e}")
 
 def _read_u32(inst, addr: int) -> int:
     """32비트 Unsigned 값 읽기 (High Word 먼저)"""
@@ -36,36 +36,34 @@ def _read_s16(inst, addr: int) -> int:
 
 def read_summary(inst) -> Dict[str, float]:
     """
-    요약 데이터 읽기
-    레지스터 매핑:
-    - 0x0036 평균전압×0.01V
-    - 0x0034 전류합×0.001A
-    - 0x002C 전체유효전력×0.001kW
-    - 0x002E 전체무효전력×0.001kvar
-    - 0x0030 전체피상전력×0.001kVA
-    - 0x0032 전체역률×0.001
-    - 0x0404 전체Active에너지×0.01kWh
-    - 0x040C 전체Reactive에너지×0.01kvarh
-    - 0x0410 전체Apparent에너지×0.01kVAh
+    TAC4300 요약 데이터 읽기
+    반환값 키:
+      avg_voltage_V, sum_current_A,
+      total_active_kW, total_reactive_kvar, total_apparent_kVA,
+      total_power_factor,
+      total_active_energy_kwh, total_reactive_energy_kvarh, total_apparent_energy_kvah
     """
-    v_avg = _read_u32(inst, 0x0036) * 0.01
-    i_sum = _read_u32(inst, 0x0034) * 0.001
-    p_tot = _read_s32(inst, 0x002C) * 0.001
-    q_tot = _read_s32(inst, 0x002E) * 0.001
-    s_tot = _read_u32(inst, 0x0030) * 0.001
-    pf    = _read_s16(inst, 0x0032) * 0.001
-    e_act = _read_s32(inst, 0x0404) * 0.01
-    e_rea = _read_s32(inst, 0x040C) * 0.01
-    e_app = _read_u32(inst, 0x0410) * 0.01
+    try:
+        v_avg = _read_u32(inst, 0x0036) * 0.01
+        i_sum = _read_u32(inst, 0x0034) * 0.001
+        p_tot = _read_s32(inst, 0x002C) * 0.001
+        q_tot = _read_s32(inst, 0x002E) * 0.001
+        s_tot = _read_u32(inst, 0x0030) * 0.001
+        pf    = _read_s16(inst, 0x0032) * 0.001
+        e_act = _read_s32(inst, 0x0404) * 0.01
+        e_rea = _read_s32(inst, 0x040C) * 0.01
+        e_app = _read_u32(inst, 0x0410) * 0.01
 
-    return {
-        "avg_voltage_V": round(v_avg,2),
-        "sum_current_A": round(i_sum,2),
-        "total_active_kW": round(p_tot,2),
-        "total_reactive_kvar": round(q_tot,2),
-        "total_apparent_kVA": round(s_tot,2),
-        "total_power_factor": round(pf,3),
-        "total_active_energy_kwh": round(e_act,2),
-        "total_reactive_energy_kvarh": round(e_rea,2),
-        "total_apparent_energy_kvah": round(e_app,2),
-    }
+        return {
+            "avg_voltage_V": round(v_avg,2),
+            "sum_current_A": round(i_sum,2),
+            "total_active_kW": round(p_tot,2),
+            "total_reactive_kvar": round(q_tot,2),
+            "total_apparent_kVA": round(s_tot,2),
+            "total_power_factor": round(pf,3),
+            "total_active_energy_kwh": round(e_act,2),
+            "total_reactive_energy_kvarh": round(e_rea,2),
+            "total_apparent_energy_kvah": round(e_app,2),
+        }
+    except Exception as e:
+        raise RuntimeError(f"센서 데이터 읽기 실패: {e}")
