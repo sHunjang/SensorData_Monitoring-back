@@ -42,20 +42,36 @@ app.include_router(solar_router.router)
 
 
 
-# @app.on_event("startup")
-# def startup_event():
-#     """
-#     서버 시작 시 Modbus Collector를 백그라운드 스레드로 실행
-#     """
-#     def run_collector():
-#         try:
-#             modbus_collector.main()
-#         except Exception as e:
-#             import logging
-#             logging.getLogger("collector").error(f"Collector crashed: {e}")
+# 실제 센서 데이터 수집
+@app.on_event("startup")
+def startup_event():
+    """
+    서버 시작 시 Collector들을 백그라운드 스레드로 실행
+    """
+    import logging
 
-#     thread = threading.Thread(target=run_collector, daemon=True)
-#     thread.start()
+    def run_modbus():
+        try:
+            modbus_collector.main()
+        except Exception as e:
+            logging.getLogger("collector").error(f"Modbus collector crashed: {e}")
+
+    def run_solar():
+        try:
+            solar_collector.main()
+        except Exception as e:
+            logging.getLogger("collector").error(f"Solar collector crashed: {e}")
+            
+    def run_env():
+        try:
+            env_collector.main()
+        except Exception as e:
+            logging.getLogger("collector").error(f"Solar collector crashed: {e}")
+
+    threading.Thread(target=run_modbus, daemon=True).start()
+    threading.Thread(target=run_solar, daemon=True).start()
+    threading.Thread(target=run_env, daemon=True).start()
+
 
 
 # ✅ 서버 시작 시 더미 collectors 실행 (스레드 기반)
@@ -65,9 +81,9 @@ def start_dummy_collectors():
         dummy_env_collector.run_collector(interval=10)
     def run_modbus():
         dummy_modbus_collector.run_collector(interval=10)
-    def run_solar():
-        dummy_solar_collector.run_collector(interval=10)
+    # def run_solar():
+    #     dummy_solar_collector.run_collector(interval=10)
 
     threading.Thread(target=run_env, daemon=True).start()
     threading.Thread(target=run_modbus, daemon=True).start()
-    threading.Thread(target=run_solar, daemon=True).start()
+    # threading.Thread(target=run_solar, daemon=True).start()

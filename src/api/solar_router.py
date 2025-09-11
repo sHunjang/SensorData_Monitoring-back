@@ -17,11 +17,6 @@ def solar_query(
     end: Optional[str] = None,
     max_points: Optional[int] = Query(default=500, ge=1, le=5000),
 ):
-    """
-    일사량 집계 조회 API
-    - DB solar_data 조회
-    - 버킷 단위 평균 + 통계 반환
-    """
     return query_solar_window(
         preset=preset,
         start=start,

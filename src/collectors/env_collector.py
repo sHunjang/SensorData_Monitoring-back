@@ -1,62 +1,62 @@
 """
 env_collector.py
-- 주기적으로 read_env()를 호출해서 DB에 데이터를 적재하는 모듈.
-- 백그라운드 태스크, systemd 서비스, 혹은 별도 프로세스로 실행 가능.
+- RS485 온습도 센서 → DB 적재
+- Slave IDs: 21, 22, 23
 """
 
-import time
-import logging
-
-from src.sensors.env_reader import read_env
+import time, logging
+from src.sensors.env_reader import create_instrument, read_env
 from src.db.client import get_cursor
+from src.common.logging_config import setup_logging
 
 log = logging.getLogger("env_collector")
 
+DEVICE_IDS = [21, 22, 23]  # 온습도 센서 ID
+MAX_FAILS = 5  # 연속 실패 허용 횟수
+
 def ensure_table():
-    """
-    환경 데이터 테이블 생성 (존재하지 않으면).
-    - time_stamp: 타임스탬프
-    - temperature: 섭씨 온도
-    - humidity: 상대 습도(%)
-    """
+    """env_data 테이블 생성"""
     with get_cursor() as cur:
         cur.execute("""
-            CREATE TABLE IF NOT EXIStime_stamp env_data (
+            CREATE TABLE IF NOT EXISTS env_data (
                 time_stamp TIMESTAMPTZ NOT NULL,
+                device_id INT NOT NULL,
                 temperature DOUBLE PRECISION,
                 humidity DOUBLE PRECISION
             );
         """)
 
-def insert_env_row(row: dict):
-    """
-    읽은 환경 데이터를 DB에 1행 삽입한다.
-    Args:
-        row (dict): {"time_stamp": datetime, "temperature": float, "humidity": float}
-    """
+def insert_row(device_id: int, row: dict):
+    """DB에 한 줄 삽입"""
     with get_cursor() as cur:
-        cur.execute(
-            "INSERT INTO env_data (time_stamp, temperature, humidity) VALUES (%s, %s, %s)",
-            (row["time_stamp"], row["temperature"], row["humidity"])
-        )
+        cur.execute("""
+            INSERT INTO env_data (time_stamp, device_id, temperature, humidity)
+            VALUES (NOW(), %s, %s, %s)
+        """, (
+            device_id,
+            row.get("temperature"),
+            row.get("humidity"),
+        ))
 
-def run_collector(interval: int = 60):
-    """
-    주기적으로 read_env() 호출 → DB 적재
-    Args:
-        interval (int): 측정 주기 (초 단위)
-    """
+def main():
+    setup_logging()
     ensure_table()
-    log.info("Env collector started. Interval=%s sec", interval)
-    while True:
-        try:
-            row = read_env()
-            insert_env_row(row)
-            log.debug("Inserted env_data row: %s", row)
-        except Exception as e:
-            log.exception("Failed to insert env_data: %s", e)
-        time.sleep(interval)
+    log.info("Env collector started.")
 
-if __name__ == "__main__":
-    # 개발 환경에서 직접 실행 가능: python -m src.collectors.env_collector
-    run_collector(interval=60)
+    fail_counts = {sid: 0 for sid in DEVICE_IDS}
+
+    while True:
+        for sid in DEVICE_IDS:
+            if fail_counts[sid] >= MAX_FAILS:
+                log.warning(f"sid={sid} disabled after {MAX_FAILS} fails")
+                continue
+            try:
+                inst = create_instrument(port="COM7", slave_id=sid)
+                row = read_env(inst)
+                insert_row(sid, row)
+                log.info(f"sid={sid} row={row}")
+                fail_counts[sid] = 0  # 성공 시 카운터 초기화
+            except Exception as e:
+                fail_counts[sid] += 1
+                log.warning(f"sid={sid} fail {fail_counts[sid]}: {e}")
+        time.sleep(60)
