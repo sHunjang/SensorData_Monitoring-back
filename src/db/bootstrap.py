@@ -99,7 +99,7 @@ SELECT time_bucket('1 month', time_stamp) AS bucket, device_id,
 FROM modbus_data GROUP BY bucket, device_id;
 
 -- 4) 자동 갱신 정책(있으면 무시)
-SELECT add_continuous_aggregate_policy('modbus_agg_15m', INTERVAL '2 hours',  INTERVAL '15 minutes', INTERVAL '15 minutes')
+SELECT add_continuous_aggregate_policy('modbus_agg_15m', INTERVAL '1 hours',  INTERVAL '15 minutes', INTERVAL '15 minutes')
 ON CONFLICT DO NOTHING;
 SELECT add_continuous_aggregate_policy('modbus_agg_1h',  INTERVAL '1 day',    INTERVAL '1 hour',     INTERVAL '15 minutes')
 ON CONFLICT DO NOTHING;

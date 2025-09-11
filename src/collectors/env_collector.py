@@ -51,11 +51,11 @@ def main():
                 log.warning(f"sid={sid} disabled after {MAX_FAILS} fails")
                 continue
             try:
-                inst = create_instrument(port="COM7", slave_id=sid)
+                inst = create_instrument(port="COM8", slave_id=sid)
                 row = read_env(inst)
                 insert_row(sid, row)
                 log.info(f"sid={sid} row={row}")
-                fail_counts[sid] = 0  # 성공 시 카운터 초기화
+                fail_counts[sid] = 0
             except Exception as e:
                 fail_counts[sid] += 1
                 log.warning(f"sid={sid} fail {fail_counts[sid]}: {e}")

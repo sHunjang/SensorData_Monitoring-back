@@ -20,14 +20,14 @@ def ensure_table():
             CREATE TABLE IF NOT EXISTS modbus_data (
                 time_stamp TIMESTAMPTZ NOT NULL,
                 device_id INT NOT NULL,
-                total_active_power_kw DOUBLE PRECISION,
-                total_reactive_power_kvar DOUBLE PRECISION,
-                total_apparent_power_kva DOUBLE PRECISION,
-                total_power_factor DOUBLE PRECISION,
-                sum_line_currents_a DOUBLE PRECISION,
                 avg_line_to_line_volts_v DOUBLE PRECISION,
                 avg_line_to_neutral_volts_v DOUBLE PRECISION,
-                total_active_energy_kWh DOUBLE PRECISION,
+                sum_current_A DOUBLE PRECISION,
+                total_active_power_kw DOUBLE PRECISION,
+                total_reactive_kvar DOUBLE PRECISION,
+                total_apparent_kVA DOUBLE PRECISION,
+                total_power_factor DOUBLE PRECISION,
+                total_active_energy_kwh DOUBLE PRECISION,
                 total_reactive_energy_kvarh DOUBLE PRECISION,
                 total_apparent_energy_kvah DOUBLE PRECISION
             );
@@ -52,15 +52,15 @@ def insert_dummy_row(device_id: int):
     with get_cursor() as cur:
         cur.execute(
             """
-            INSERT INTO modbus_data (
-                time_stamp, device_id,
-                total_active_power_kw, total_reactive_power_kvar, total_apparent_power_kva,
-                total_power_factor, sum_line_currents_a,
-                avg_line_to_line_volts_v, avg_line_to_neutral_volts_v,
-                total_active_energy_kWh, total_reactive_energy_kvarh, total_apparent_energy_kvah
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """,
-            (
+            INSERT INTO modbus_data
+            (time_stamp, device_id,
+             avg_line_to_line_volts_v, avg_line_to_neutral_volts_v,
+             sum_current_A,
+             total_active_power_kw, total_reactive_kvar, total_apparent_kVA,
+             total_power_factor,
+             total_active_energy_kwh, total_reactive_energy_kvarh, total_apparent_energy_kvah)
+            VALUES (NOW(), %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
                 row["time_stamp"], row["device_id"],
                 row["p"], row["q"], row["s"],
                 row["pf"], row["i_sum"],

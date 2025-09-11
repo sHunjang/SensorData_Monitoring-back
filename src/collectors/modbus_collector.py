@@ -11,15 +11,14 @@ from src.common.logging_config import setup_logging
 log = logging.getLogger("modbus_collector")
 
 # 장치 ID
-THREE_WIRE_IDS = [11, 12, 13]  # 3상 3선
-FOUR_WIRE_IDS  = [14, 15]      # 3상 4선
-DEVICE_IDS = THREE_WIRE_IDS + FOUR_WIRE_IDS
+FOUR_WIRE_IDS  = [11, 12, 13]      # 3상 4선
+THREE_WIRE_IDS = [14, 15]  # 3상 3선
+DEVICE_IDS = FOUR_WIRE_IDS + THREE_WIRE_IDS
 
 # 연속 실패 허용 횟수
 MAX_FAILS = 3
 
 def ensure_table():
-    """modbus_data 테이블 생성"""
     with get_cursor() as cur:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS modbus_data (
@@ -39,27 +38,29 @@ def ensure_table():
         """)
 
 def insert_row(device_id: int, row: dict):
-    """DB에 한 줄 삽입"""
     with get_cursor() as cur:
         cur.execute("""
             INSERT INTO modbus_data
             (time_stamp, device_id,
              avg_line_to_line_volts_v, avg_line_to_neutral_volts_v,
-             sum_current_A,
-             total_active_kW, total_reactive_kvar, total_apparent_kVA,
-             total_power_factor,
+             sum_current_A, total_active_power_kw, total_reactive_kvar,
+             total_apparent_kVA, total_power_factor,
              total_active_energy_kwh, total_reactive_energy_kvarh, total_apparent_energy_kvah)
-            VALUES (NOW(), %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (NOW(), %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
             device_id,
-            # 전압은 선간/상전압 중 하나만 값, 나머지는 None
-            row["avg_line_to_line_volts_v"] if device_id in THREE_WIRE_IDS else None,
-            row["avg_line_to_neutral_volts_v"] if device_id in FOUR_WIRE_IDS else None,
+            row["avg_voltage_V"] if device_id in FOUR_WIRE_IDS else None,
+            row["avg_voltage_V"] if device_id in THREE_WIRE_IDS else None,
             row["sum_current_A"],
-            row["total_active_kW"], row["total_reactive_kvar"], row["total_apparent_kVA"],
+            row["total_active_kW"],
+            row["total_reactive_kvar"],
+            row["total_apparent_kVA"],
             row["total_power_factor"],
-            row["total_active_energy_kwh"], row["total_reactive_energy_kvarh"], row["total_apparent_energy_kvah"],
+            row["total_active_energy_kwh"],
+            row["total_reactive_energy_kvarh"],
+            row["total_apparent_energy_kvah"],
         ))
+
 
 def main():
     setup_logging()
