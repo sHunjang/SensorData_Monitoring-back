@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
     if mode == "real":
         # threading.Thread(target=modbus_collector.main, daemon=True).start()
         threading.Thread(target=env_collector.main, daemon=True).start()
-        # threading.Thread(target=solar_collector.main, daemon=True).start()
+        threading.Thread(target=solar_collector.main, daemon=True).start()
     else:
         threading.Thread(target=lambda: dummy_modbus_collector.run_collector(interval=10), daemon=True).start()
         threading.Thread(target=lambda: dummy_env_collector.run_collector(interval=10), daemon=True).start()

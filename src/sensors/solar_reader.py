@@ -6,7 +6,7 @@ solar_reader.py
 import minimalmodbus
 import serial
 
-def create_instrument(port="COM7", slave_id=31, baudrate=9600) -> minimalmodbus.Instrument:
+def create_instrument(port="COM3", slave_id=1, baudrate=4800) -> minimalmodbus.Instrument:
     inst = minimalmodbus.Instrument(port, slave_id)
     inst.serial.baudrate = baudrate
     inst.serial.bytesize = 8

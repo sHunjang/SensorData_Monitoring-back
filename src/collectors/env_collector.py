@@ -15,7 +15,7 @@ log = logging.getLogger("env_collector")
 
 DEVICE_IDS   = [21]   # 보유 센서 ID에 맞게 수정
 SERIAL_PORT  = "COM3"         # RS485 포트
-INTERVAL_SEC = 5             # 수집 주기(초)
+INTERVAL_SEC = 1             # 수집 주기(초)
 MAX_FAILS    = 5              # 연속 실패 허용
 
 def ensure_table():

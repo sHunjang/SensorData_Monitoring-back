@@ -87,7 +87,7 @@ def query_env(
                 params.append(device_id)
 
             # 정렬 및 제한 추가
-            sql += " ORDER BY time_stamp ASC LIMIT %s"
+            sql += " ORDER BY time_stamp DESC LIMIT %s"
             params.append(max_points)
 
             cur.execute(sql, tuple(params))
