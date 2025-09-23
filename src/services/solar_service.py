@@ -1,81 +1,83 @@
 """
-solar_service.py
-- solar_data 집계 조회
-- 실패 시에도 200 + 빈 payload 반환
-- bucket, window는 KST로 ISO 문자열 반환
+src/services/solar_service.py
+
+일사량(센서) 서비스
+- query_solar_window: 히스토리(윈도우) 조회 반환 (make_query_response)
+- 모든 시간은 KST tz-aware ISO 문자열로 반환
 """
-from typing import List, Dict, Optional
+
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
+
 from src.db.client import get_cursor
-from src.services.modbus_service import resolve_window  # UTC 기반 윈도우 해석
+from src.api._utils import iso_kst, make_query_response
 
-BUCKET_MAP = {
-    "15m": "1 minute",
-    "1h":  "5 minutes",
-    "1d":  "1 hour",
-    "1w":  "6 hours",
-    "1mo": "1 day",
-}
+KST = ZoneInfo("Asia/Seoul")
 
-def query_solar_window(
-    preset: Optional[str],
-    start: Optional[str],
-    end: Optional[str],
-    max_points: Optional[int] = None,
-) -> Dict:
+
+def query_solar_window(preset: Optional[str] = None,
+                       start: Optional[str] = None,
+                       end: Optional[str] = None,
+                       max_points: int = 500) -> Dict[str, Any]:
+    """
+    solar 데이터 윈도우 조회
+    - preset 또는 start/end 사용
+    - 반환: make_query_response 형태
+    """
+    now = datetime.now(timezone.utc)
+    if preset and not (start or end):
+        if preset == "15m":
+            s, e, bucket = now - timedelta(minutes=15), now, "1 minute"
+        elif preset == "1h":
+            s, e, bucket = now - timedelta(hours=1), now, "5 minutes"
+        elif preset == "1d":
+            s, e, bucket = now - timedelta(days=1), now, "1 hour"
+        elif preset == "1w":
+            s, e, bucket = now - timedelta(weeks=1), now, "6 hours"
+        else:
+            s, e, bucket = now - timedelta(days=30), now, "1 day"
+    else:
+        s = datetime.fromisoformat(start) if start else now - timedelta(hours=1)
+        e = datetime.fromisoformat(end) if end else now
+        if s.tzinfo is None:
+            s = s.replace(tzinfo=timezone.utc)
+        if e.tzinfo is None:
+            e = e.replace(tzinfo=timezone.utc)
+        bucket = "1 hour"
+
     try:
-        s_utc, e_utc = resolve_window(preset, start, end)
-        bucket_str = BUCKET_MAP.get(preset, "1 hour")
-
-        sql = f"""
-            SELECT time_bucket(%s, time_stamp) AT TIME ZONE 'Asia/Seoul' AS bucket_kst,
-                   avg(solar) AS solar
-            FROM solar_data
-            WHERE time_stamp >= %s AND time_stamp <= %s
-            GROUP BY bucket_kst
-            ORDER BY bucket_kst;
-        """
-        params = [bucket_str, s_utc, e_utc]
-
         with get_cursor() as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
+            cur.execute("""
+                SELECT time_stamp, device_id, solar
+                FROM solar_data
+                WHERE time_stamp >= %s AND time_stamp <= %s
+                ORDER BY time_stamp ASC
+                LIMIT %s;
+            """, (s, e, max_points))
 
-        data: List[Dict] = []
-        for r in rows:
-            data.append({
-                "bucket": r[0].isoformat(),                                 # KST ISO
-                "solar":  round(float(r[1]), 2) if r[1] is not None else None,
+            rows_raw = cur.fetchall()
+
+        rows: List[Dict[str, Any]] = []
+        for ts, device_id, solar in rows_raw:
+            if ts is not None and ts.tzinfo is None:
+                ts = ts.replace(tzinfo=KST)
+            rows.append({
+                "bucket": iso_kst(ts),
+                "device_id": device_id,
+                "solar": round(float(solar), 2) if solar is not None else None
             })
 
-        stats = _compute_stats(data)
-
-        kst = ZoneInfo("Asia/Seoul")
-        return {
-            "window": {"start": s_utc.astimezone(kst).isoformat(), "end": e_utc.astimezone(kst).isoformat()},
-            "bucket": bucket_str,
-            "series": ["solar"],
-            "data": data,
-            "stats": stats,
-        }
-    except Exception:
-        # 503 대신 빈 payload로 200 응답을 유도
-        return {
-            "window": None,
-            "bucket": BUCKET_MAP.get(preset, "1 hour"),
-            "series": ["solar"],
-            "data": [],
-            "stats": {"solar": {"avg": None, "max": None, "min": None, "count": 0}},
-            "error": "solar query failed",
+        sols = [r["solar"] for r in rows if r["solar"] is not None]
+        stats = {
+            "solar": {
+                "avg": round(sum(sols) / len(sols), 2) if sols else None,
+                "max": max(sols) if sols else None,
+                "min": min(sols) if sols else None,
+                "count": len(sols)
+            }
         }
 
-def _compute_stats(rows: List[Dict]) -> Dict[str, Dict]:
-    vals = [float(r["solar"]) for r in rows if r.get("solar") is not None]
-    return {
-        "solar": {
-            "avg": round(sum(vals) / len(vals), 2) if vals else None,
-            "max": round(max(vals), 2) if vals else None,
-            "min": round(min(vals), 2) if vals else None,
-            "count": len(vals),
-        }
-    }
+        return make_query_response(s, e, bucket, ["solar"], rows, stats)
+    except Exception as ex:
+        return make_query_response(None, None, "1 hour", ["solar"], [], {}, error=str(ex))

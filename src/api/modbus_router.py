@@ -1,123 +1,88 @@
+# src/api/modbus_router.py
 """
-/data/modbus routes
-- /realtime?device_id=...
-- /query?device_id=...&series=power,voltage,...
-- /today?device_id=...
+FastAPI 라우터: /data/modbus
 
-목적:
-- modbus 관련 시계열 데이터와 스냅샷을 일관된 JSON 스펙으로 제공.
-- DB에서 time_stamp를 UTC로 정규화하여 읽고, 응답에서는 KST ISO 문자열을 사용.
+- 이 파일은 반드시 `router = APIRouter(...)`를 노출해야 합니다.
+- 붙여넣기 후 `uvicorn src.main:app --reload`로 서버 재시작.
+- 의존: src.services.modbus_service 에 query_modbus_window, query_modbus_realtime 구현 필요.
+- 의존: src.api._utils 의 make_realtime_response (표준 응답 포맷) 사용.
 """
-from fastapi import APIRouter, Query
-from typing import Optional
-from datetime import datetime, timezone, timedelta
-from src.db.client import get_cursor
-from src.api._utils import make_query_response, make_realtime_response
 
+from typing import List, Optional
+
+from fastapi import APIRouter, Query, HTTPException
+
+# 서비스 레이어 호출 (데이터 조회 로직은 서비스에 둠)
+from src.services.modbus_service import query_modbus_window, query_modbus_realtime, get_today_energy_kwh
+from src.api._utils import make_realtime_response
+
+# 라우터 인스턴스: 반드시 이 이름(router)으로 main.py에서 포함하도록 함
 router = APIRouter(prefix="/data/modbus", tags=["modbus"])
 
+
 @router.get("/realtime")
-def realtime(device_id: int = Query(...)):
+def get_realtime(device_id: int = Query(..., description="장치 ID")):
     """
-    가장 최근 한 행을 가져와서 snapshot 반환.
-    반환 예: {"device_id": 11, "time_stamp": "2025-09-23T13:00:00+09:00", "metrics": {"p_kw": 1.23, "e_kwh": 4.56}}
+    실시간 최신값 조회
+    - device_id: 필수
+    - 서비스가 None 반환 시 503으로 응답
+    - 반환 포맷: make_realtime_response 표준 포맷
     """
     try:
-        with get_cursor() as cur:
-            cur.execute("""
-                SELECT time_stamp AT TIME ZONE 'UTC' AS ts_utc,
-                       device_id,
-                       total_active_power_kw, total_active_energy_kwh,
-                       avg_line_to_line_volts_v, sum_line_currents_a, total_power_factor
-                FROM modbus_data
-                WHERE device_id = %s
-                ORDER BY time_stamp DESC
-                LIMIT 1
-            """, (device_id,))
-            r = cur.fetchone()
-            if not r:
-                return make_realtime_response(device_id, None, {"p_kw": None, "e_kwh": None})
-            ts, dev, p_kw, e_kwh, v_avg, i_sum, pf = r
-            metrics = {"p_kw": p_kw, "e_kwh": e_kwh, "v_avg": v_avg, "i_sum": i_sum, "pf": pf}
-            return make_realtime_response(dev, ts, metrics, raw=r)
-    except Exception as ex:
-        return {"error": str(ex)}
+        data = query_modbus_realtime(device_id)
+        if not data:
+            # 장치에 데이터가 없음을 의미. 프론트엔드에서 503 처리하도록 함.
+            raise HTTPException(status_code=503, detail="장치에서 데이터 없음")
+        # data는 서비스에서 이미 키-값 형태로 정규화되어 있다고 가정
+        metrics = {
+            "p_kw": data.get("power"),
+            "e_kwh": data.get("energy"),
+            "v_ll": data.get("voltage_ll"),
+            "v_ln": data.get("voltage_ln"),
+            "i_sum": data.get("current"),
+        }
+        return make_realtime_response(device_id, data.get("time_stamp"), metrics, raw=data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        # 내부 에러는 500으로 반환
+        raise HTTPException(status_code=500, detail=f"예상치 못한 오류: {e}")
+
 
 @router.get("/query")
-def query(device_id: int = Query(...), series: Optional[str] = Query(None), preset: Optional[str] = Query(None), start: Optional[str] = Query(None), end: Optional[str] = Query(None), max_points: int = Query(500)):
+def get_query(
+    device_id: int = Query(..., description="장치 ID"),
+    series: Optional[List[str]] = Query(default=None, description="조회 시리즈, 예: power,energy"),
+    preset: Optional[str] = Query(default="1h", description="preset: 15m|1h|1d|1w|1mo"),
+    start: Optional[str] = Query(default=None, description="ISO start datetime (optional)"),
+    end: Optional[str] = Query(default=None, description="ISO end datetime (optional)"),
+    max_points: int = Query(1000, ge=1, le=5000, description="최대 포인트 수"),
+):
     """
-    시계열 쿼리:
-    - series는 comma separated string. 가능한 값: power,energy,voltage,current,pf
-    - 반환: make_query_response 형태
+    히스토리(집계) 조회 엔드포인트
+    - device_id: 필수
+    - series: 요청할 series 키 리스트 (없으면 기본값 사용)
+    - preset/start/end: 시간 윈도우
+    - 반환: 서비스(query_modbus_window)의 make_query_response 구조
     """
-    from datetime import datetime
-    def resolve_window(preset, start, end):
-        now = datetime.now(timezone.utc)
-        if preset and not (start or end):
-            if preset == "15m": return now - timedelta(minutes=15), now, "1 minute"
-            if preset == "1h": return now - timedelta(hours=1), now, "5 minutes"
-            if preset == "1d": return now - timedelta(days=1), now, "1 hour"
-            if preset == "1w": return now - timedelta(weeks=1), now, "6 hours"
-            if preset == "1mo": return now - timedelta(days=30), now, "1 day"
-        s = datetime.fromisoformat(start) if start else now - timedelta(hours=1)
-        e = datetime.fromisoformat(end) if end else now
-        if s.tzinfo is None: s = s.replace(tzinfo=timezone.utc)
-        if e.tzinfo is None: e = e.replace(tzinfo=timezone.utc)
-        return s, e, "1 hour"
-
-    s, e, bucket = resolve_window(preset, start, end)
-    sel_series = (series or "power").split(",")
-    col_map = {
-        "power": "total_active_power_kw",
-        "energy": "total_active_energy_kwh",
-        "voltage": "avg_line_to_line_volts_v",
-        "current": "sum_line_currents_a",
-        "pf": "total_power_factor"
-    }
-    # build SQL select columns robustly
-    select_cols = ["time_stamp AT TIME ZONE 'UTC' as ts_utc", "device_id"] + [f"{col_map.get(s, 'NULL')} AS {s}" for s in sel_series]
-    sql_select = ", ".join(select_cols)
     try:
-        with get_cursor() as cur:
-            cur.execute(f"""
-                SELECT {sql_select}
-                FROM modbus_data
-                WHERE device_id = %s AND time_stamp >= %s AND time_stamp <= %s
-                ORDER BY time_stamp ASC
-                LIMIT %s
-            """, (device_id, s, e, max_points))
-            rows = []
-            for r in cur.fetchall():
-                ts = r[0]
-                dev = r[1]
-                vals = r[2:]
-                row = {"bucket": ts.isoformat() if ts else None, "device_id": dev}
-                for i, k in enumerate(sel_series):
-                    row[k] = vals[i]
-                rows.append(row)
-        # stats
-        stats = {}
-        for k in sel_series:
-            vals = [r[k] for r in rows if r.get(k) is not None]
-            stats[k] = {"avg": sum(vals)/len(vals) if vals else None, "max": max(vals) if vals else None, "min": min(vals) if vals else None, "count": len(vals)}
-        return make_query_response(s, e, bucket, sel_series, rows, stats)
-    except Exception as ex:
-        return make_query_response(None, None, bucket, [], [], {}, error=str(ex))
+        keys = series or ["power", "current", "voltage"]
+        return query_modbus_window(device_id=device_id, series=keys, preset=preset, start=start, end=end, max_points=max_points)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"예상치 못한 오류: {e}")
+
 
 @router.get("/today")
-def today(device_id: int = Query(...)):
+def modbus_today(device_id: int = Query(..., description="장치 ID")):
     """
-    오늘(서버 KST 00:00)부터 현재까지 누적 전력량 조회(간단 구현).
-    - 반환: { device_id, kwh }
+    당일 전력량(kWh) 반환.
+    - device_id 필수
+    - 반환: { device_id: <int>, kwh: <float|null> }
     """
     try:
-        with get_cursor() as cur:
-            # date_trunc('day', NOW() AT TIME ZONE 'Asia/Seoul')는 KST의 오늘 00:00을 반환.
-            cur.execute("""
-                SELECT SUM(total_active_energy_kwh) FROM modbus_data
-                WHERE device_id=%s AND time_stamp >= date_trunc('day', NOW() AT TIME ZONE 'Asia/Seoul') AT TIME ZONE 'UTC'
-            """, (device_id,))
-            v = cur.fetchone()[0]
-            return {"device_id": device_id, "kwh": v}
-    except Exception as ex:
-        return {"device_id": device_id, "kwh": None, "error": str(ex)}
+        kwh = get_today_energy_kwh(device_id)
+        return {"device_id": device_id, "kwh": (None if kwh is None else round(kwh, 3))}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
