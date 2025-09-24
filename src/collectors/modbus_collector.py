@@ -31,7 +31,7 @@ MAX_FAILS = int(os.getenv("MODBUS_MAX_FAILS", "3"))
 
 # 기본 시리얼 포트와 수집 인터벌(초)은 환경변수로 덮어쓸 수 있음
 SERIAL_PORT = os.getenv("MODBUS_PORT", "COM3")
-POLL_INTERVAL = int(os.getenv("MODBUS_POLL_INTERVAL", "60"))
+POLL_INTERVAL = int(os.getenv("MODBUS_POLL_INTERVAL", "1"))
 
 # KST ZoneInfo
 KST = ZoneInfo("Asia/Seoul")

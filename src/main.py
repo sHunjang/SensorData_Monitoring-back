@@ -53,13 +53,13 @@ async def lifespan(app: FastAPI):
     log.info("collector mode = %s", mode)
 
     if mode == "real":
-        # threading.Thread(target=modbus_collector.main, daemon=True).start()
+        threading.Thread(target=modbus_collector.main, daemon=True).start()
         threading.Thread(target=env_collector.main, daemon=True).start()
         threading.Thread(target=solar_collector.main, daemon=True).start()
     else:
-        threading.Thread(target=lambda: dummy_modbus_collector.run_collector(interval=10), daemon=True).start()
-        threading.Thread(target=lambda: dummy_env_collector.run_collector(interval=10), daemon=True).start()
-        threading.Thread(target=lambda: dummy_solar_collector.run_collector(interval=10), daemon=True).start()
+        threading.Thread(target=lambda: dummy_modbus_collector.run_collector(interval=3), daemon=True).start()
+        threading.Thread(target=lambda: dummy_env_collector.run_collector(interval=3), daemon=True).start()
+        threading.Thread(target=lambda: dummy_solar_collector.run_collector(interval=3), daemon=True).start()
 
     yield
     # 종료 훅: 데몬 스레드는 프로세스 종료 시 함께 종료됨
@@ -71,7 +71,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # CORS
-origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+
+origins = os.getenv(
+    "ALLOWED_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173"
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in origins if o.strip()],
