@@ -1,16 +1,14 @@
 # src/api/modbus_router.py
 """
-/data/modbus/*
-- /query  : 시계열 조회 (기존)
-- /realtime : 단일 장치의 최신값(프론트에서 실시간 대시보드용)
-- /today    : 장치별 당일 누적 전력량(kWh) (KST 기준 자정~현재)
+Modbus API router
+- /data/modbus/query  : 시계열 조회 (이미 존재하던 엔드포인트, 유지)
+- /data/modbus/realtime : 최신 단일 레코드 반환 (프론트의 fetchRealtime 사용용)
+- /data/modbus/today    : '오늘' 누적 전력량(kWh) 반환 (프론트의 fetchTodayEnergy 사용용)
 
-설계 원칙:
-- DB의 time_stamp 컬럼은 TIMESTAMPTZ로 가정.
-- 프론트와의 호환성을 위해 realtime 응답에 'metrics' 객체를 포함.
-- 날짜/시간 처리: 입력 ISO는 flexible 처리(Z 포함 가능). 내부 연산은 UTC 기준으로 수행하되
-  반환되는 'bucket' 또는 'time_stamp'는 iso_kst()로 KST tz-aware ISO 문자열로 만든다.
-- 안전성: 입력 검증, DB 조회 결과 없는 경우를 방어적으로 처리.
+주의:
+- DB의 time_stamp는 TIMESTAMPTZ로 가정.
+- 모든 시간 연산은 tz-aware로 처리(UTC 내부 사용, KST 변환은 iso_kst).
+- 방어적 코딩: NULL 처리, 컬럼 누락 대비.
 """
 from fastapi import APIRouter, Query, HTTPException
 from typing import Optional, List, Dict, Any
@@ -28,13 +26,9 @@ KST = ZoneInfo("Asia/Seoul")
 
 
 def parse_iso_flexible(s: str) -> datetime:
-    """
-    유연한 ISO 파서
-    - 입력이 "2025-09-24T01:00:00Z" 처럼 Z로 끝나면 +00:00으로 변환
-    - fromisoformat으로 파싱 후 tz가 없으면 UTC로 지정
-    """
+    """Flexible ISO parser that accepts trailing 'Z' and returns tz-aware datetime (UTC)."""
     if s is None:
-        raise ValueError("empty datetime")
+        raise ValueError("empty")
     s = s.strip()
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
@@ -45,12 +39,7 @@ def parse_iso_flexible(s: str) -> datetime:
 
 
 def resolve_window(preset: Optional[str], start: Optional[str], end: Optional[str]):
-    """
-    preset 또는 start/end로 조회 윈도우 계산 (UTC tz-aware 반환)
-    - preset 우선: '15m','1h','1d','1w','1mo' 지원
-    - start/end가 주어지면 parse_iso_flexible 사용
-    - 반환: (start_utc, end_utc, bucket_label)
-    """
+    """Resolve requested window to (start_utc, end_utc, bucket_label)."""
     now = datetime.now(timezone.utc)
     if preset and not (start or end):
         if preset == "15m":
@@ -70,7 +59,7 @@ def resolve_window(preset: Optional[str], start: Optional[str], end: Optional[st
     except Exception as ex:
         raise ValueError(f"invalid start/end datetime: {ex}")
 
-    # ensure tz-aware and normalized to UTC
+    # ensure tz-aware UTC
     if s.tzinfo is None:
         s = s.replace(tzinfo=timezone.utc)
     if e.tzinfo is None:
@@ -78,6 +67,9 @@ def resolve_window(preset: Optional[str], start: Optional[str], end: Optional[st
     return s.astimezone(timezone.utc), e.astimezone(timezone.utc), "1 hour"
 
 
+# -------------------------
+# /query : 기존 시계열 조회
+# -------------------------
 @router.get("/query")
 def query_modbus(
     preset: Optional[str] = Query(None),
@@ -89,7 +81,17 @@ def query_modbus(
 ):
     """
     안전한 modbus 시계열 조회.
-    (기존 구현을 유지)
+    반환되는 series:
+      avg_line_to_line_volts_v,
+      avg_line_to_neutral_volts_v,
+      sum_line_currents_a,
+      total_active_power_kw,
+      total_reactive_power_kvar,
+      total_apparent_power_kva,
+      total_power_factor,
+      total_active_energy_kwh,
+      total_reactive_energy_kvarh,
+      total_apparent_energy_kvah
     """
     dev_id = device_id if device_id is not None else deviceId
 
@@ -181,34 +183,29 @@ def query_modbus(
                 "count": len(vals),
             }
 
-        # make_query_response 재사용 (통일된 응답 포맷)
         return make_query_response(s, e, bucket, series_keys, rows, stats)
 
     except Exception as ex:
         raise HTTPException(status_code=500, detail=str(ex))
 
 
-# ------------------------------
-# /realtime : 최신 한 건(장치별)
-# ------------------------------
+# ------------------------------------------------
+# /realtime : 최신 단일 행을 반환 (프론트용 간편 엔드포인트)
+# ------------------------------------------------
 @router.get("/realtime")
-def realtime_modbus(device_id: Optional[int] = Query(None), deviceId: Optional[int] = Query(None)):
+def modbus_realtime(device_id: Optional[int] = Query(None), deviceId: Optional[int] = Query(None)):
     """
-    최신 한 건을 반환한다 (프론트 realtime 뷰에서 사용).
-    반환 예시:
+    최신 레코드 한 건을 읽어 프론트가 기대하는 형태로 반환.
+    응답 예:
     {
       "device_id": 11,
       "time_stamp": "2025-09-24T10:01:13.111555+09:00",
-      "metrics": {
-         "p_kw": 1.23,
-         "total_active_energy_kwh": 1234.5,
-         ...
-      },
-      "raw": { ... }  # 선택적: DB 행을 그대로 노출(디버깅용)
+      "metrics": { "p_kw": 5.97, "e_kwh": 497.812, ... },
+      "raw": { ... full row ... }
     }
     """
-    dev_id = device_id if device_id is not None else deviceId
-    if dev_id is None:
+    dev = device_id if device_id is not None else deviceId
+    if dev is None:
         raise HTTPException(status_code=400, detail="device_id is required")
 
     try:
@@ -229,111 +226,82 @@ def realtime_modbus(device_id: Optional[int] = Query(None), deviceId: Optional[i
                 WHERE device_id = %s
                 ORDER BY time_stamp DESC
                 LIMIT 1
-            """, (dev_id,))
+            """, (dev,))
             row = cur.fetchone()
-
             if not row:
-                # 존재하지 않는 경우, 빈 metrics 반환 (프론트에서 방어적 처리)
-                return {
-                    "device_id": dev_id,
-                    "time_stamp": None,
-                    "metrics": {},
-                    "raw": None
-                }
+                return {"device_id": dev, "time_stamp": None, "metrics": {"p_kw": None, "e_kwh": None}, "raw": None}
 
-            (ts, dev,
-             v_ll, v_ln, sum_i,
-             p_kw, q_kvar, s_kva,
-             pf,
-             e_kwh, e_kvarh, e_kvah) = row
+            ts, dev_id, v_ll, v_ln, sum_i, p_kw, q_kvar, s_kva, pf, e_kwh, e_kvarh, e_kvah = row
 
-            # metrics 객체: 프론트가 p_kw 등의 필드를 기대하므로 친숙한 키도 함께 넣음
             metrics = {
-                # 전력(실시간)
                 "p_kw": p_kw,
-                "total_active_power_kw": p_kw,
-                # 에너지(누적)
                 "e_kwh": e_kwh,
-                "total_active_energy_kwh": e_kwh,
-                # 기타 원시 필드
+                "v_avg": (v_ll if v_ll is not None else v_ln),
+                "i_sum": sum_i,
+                "pf": pf,
+            }
+
+            raw = {
+                "time_stamp": iso_kst(ts) if ts else None,
+                "device_id": dev_id,
                 "avg_line_to_line_volts_v": v_ll,
                 "avg_line_to_neutral_volts_v": v_ln,
                 "sum_line_currents_a": sum_i,
+                "total_active_power_kw": p_kw,
                 "total_reactive_power_kvar": q_kvar,
                 "total_apparent_power_kva": s_kva,
                 "total_power_factor": pf,
+                "total_active_energy_kwh": e_kwh,
                 "total_reactive_energy_kvarh": e_kvarh,
                 "total_apparent_energy_kvah": e_kvah,
             }
 
-            return {
-                "device_id": dev,
-                "time_stamp": iso_kst(ts) if ts else None,
-                "metrics": metrics,
-                "raw": {
-                    "bucket": iso_kst(ts) if ts else None,
-                    "device_id": dev,
-                    "avg_line_to_line_volts_v": v_ll,
-                    "avg_line_to_neutral_volts_v": v_ln,
-                    "sum_line_currents_a": sum_i,
-                    "total_active_power_kw": p_kw,
-                    "total_reactive_power_kvar": q_kvar,
-                    "total_apparent_power_kva": s_kva,
-                    "total_power_factor": pf,
-                    "total_active_energy_kwh": e_kwh,
-                    "total_reactive_energy_kvarh": e_kvarh,
-                    "total_apparent_energy_kvah": e_kvah,
-                }
-            }
+            return {"device_id": dev_id, "time_stamp": iso_kst(ts) if ts else None, "metrics": metrics, "raw": raw}
+
     except Exception as ex:
         raise HTTPException(status_code=500, detail=str(ex))
 
 
-# ------------------------------
-# /today : KST 자정 기준 당일 누적 전력량 계산
-# ------------------------------
+# ------------------------------------------------
+# /today : 오늘(한국시간) 누적 전력량(kWh) 반환
+# ------------------------------------------------
 @router.get("/today")
-def today_energy(device_id: Optional[int] = Query(None), deviceId: Optional[int] = Query(None)):
+def modbus_today(device_id: Optional[int] = Query(None), deviceId: Optional[int] = Query(None)):
     """
-    device_id(또는 deviceId)가 필요.
-    계산 방법:
-      - KST(Asia/Seoul) 기준 오늘 자정(start_of_day_kst)부터 현재까지의
-        total_active_energy_kwh 컬럼의 MIN/MAX 차이를 당일 전력량으로 반환.
-      - DB에 누적 계량값이 저장되는 설정에서 동작하도록 설계됨.
-    응답:
-      { "device_id": 11, "kwh": 12.34 }
+    '오늘' 누적 전력량(kWh)을 계산하여 반환.
+    방법:
+      - KST 자정(start_of_day)부터 현재까지의 total_active_energy_kwh의 (max - min)을 계산.
+      - 값이 존재하지 않으면 kwh: null 반환.
+    응답 예:
+      { "device_id": 11, "kwh": 12.345, "raw": { "min":..., "max":... } }
     """
-    dev_id = device_id if device_id is not None else deviceId
-    if dev_id is None:
+    dev = device_id if device_id is not None else deviceId
+    if dev is None:
         raise HTTPException(status_code=400, detail="device_id is required")
 
     try:
-        # KST 자정 계산: 현재 KST의 자정 -> UTC로 변환하여 DB 타임스탬프 범위를 만듦
-        now_kst = datetime.now(KST)
+        # 현재 시각(UTC)와 KST의 자정 계산
+        now_utc = datetime.now(timezone.utc)
+        now_kst = now_utc.astimezone(KST)
         start_of_day_kst = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
-        # DB에 저장된 timestamptz는 타임존 정보를 포함하므로 UTC로 변환해서 질의
+        # SQL 비교를 UTC로
         start_utc = start_of_day_kst.astimezone(timezone.utc)
-        end_utc = datetime.now(timezone.utc)
 
         with get_cursor() as cur:
-            # MIN/MAX으로 당일 누적 사용량 계산
+            # min/max 범위에서 energy 칼럼이 NULL인 경우를 대비
             cur.execute("""
                 SELECT MIN(total_active_energy_kwh) AS mn, MAX(total_active_energy_kwh) AS mx
                 FROM modbus_data
                 WHERE device_id = %s AND time_stamp >= %s AND time_stamp <= %s
-            """, (dev_id, start_utc, end_utc))
-            res = cur.fetchone()
-            if not res:
-                return {"device_id": dev_id, "kwh": None}
-            mn, mx = res
+            """, (dev, start_utc, now_utc))
+            mn_mx = cur.fetchone()
+            if mn_mx is None:
+                return {"device_id": dev, "kwh": None, "raw": {}}
+            mn, mx = mn_mx
             if mn is None or mx is None:
-                return {"device_id": dev_id, "kwh": None}
-            # 보정: 음수 방지
-            kwh = mx - mn
-            if kwh < 0:
-                # 누적 카운터가 리셋된 경우(재시작 등) 음수 발생 가능 -> None 으로 처리하거나 0으로 처리
-                return {"device_id": dev_id, "kwh": None}
-            return {"device_id": dev_id, "kwh": float(kwh)}
+                return {"device_id": dev, "kwh": None, "raw": {"min": mn, "max": mx}}
+            kwh = float(mx) - float(mn)
+            return {"device_id": dev, "kwh": kwh, "raw": {"min": mn, "max": mx}}
 
     except Exception as ex:
         raise HTTPException(status_code=500, detail=str(ex))

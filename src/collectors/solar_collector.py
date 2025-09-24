@@ -13,7 +13,7 @@ from src.common.logging_config import setup_logging
 
 log = logging.getLogger("solar_collector")
 
-DEVICE_IDS = [1]
+DEVICE_IDS = [31]
 MAX_FAILS = 5
 INTERVAL_SEC = 1  # 수집 주기(초)
 

@@ -24,7 +24,7 @@ from src.db.client import get_cursor
 log = logging.getLogger("dummy_solar")
 
 # 테스트할 device id 목록. 실제 환경에 맞게 변경 가능.
-DEVICE_IDS: List[int] = [1]
+DEVICE_IDS: List[int] = [31]
 
 # 최대 실패 허용 횟수 (DB 접속 문제 등)
 MAX_FAILS = 5

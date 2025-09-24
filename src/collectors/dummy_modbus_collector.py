@@ -26,7 +26,7 @@ log.setLevel(logging.INFO)
 DEVICES_ENV = os.getenv("DUMMY_MODBUS_DEVICES", "11")
 DEVICE_IDS = [int(x.strip()) for x in DEVICES_ENV.split(",") if x.strip()]
 if not DEVICE_IDS:
-    DEVICE_IDS = [11]  # 최소 1개 보장
+    DEVICE_IDS = [11, 12, 13, 14, 15]  # 최소 1개 보장
 
 POLL_INTERVAL = int(os.getenv("DUMMY_MODBUS_INTERVAL", "3"))
 KST = ZoneInfo("Asia/Seoul")

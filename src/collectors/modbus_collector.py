@@ -22,8 +22,8 @@ from src.common.logging_config import setup_logging
 log = logging.getLogger("modbus_collector")
 
 # 장치 ID 구분 (실장비 ID를 여기에 나열)
-FOUR_WIRE_IDS  = [14, 15]        # 3상 4선 -> LN 사용
 THREE_WIRE_IDS = [11, 12, 13]    # 3상 3선 -> LL 사용
+FOUR_WIRE_IDS  = [14, 15]        # 3상 4선 -> LN 사용
 DEVICE_IDS = THREE_WIRE_IDS + FOUR_WIRE_IDS
 
 # 연속 실패 허용 횟수
