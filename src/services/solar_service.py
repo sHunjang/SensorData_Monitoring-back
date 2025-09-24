@@ -39,7 +39,7 @@ def query_solar_window(preset: Optional[str] = None,
                     SELECT time_stamp, device_id, solar
                     FROM solar_data
                     WHERE time_stamp >= %s AND time_stamp <= %s
-                    ORDER BY time_stamp ASC
+                    ORDER BY time_stamp DESC
                     LIMIT %s;
                 """, (s, e, max_points))
             else:
@@ -47,7 +47,7 @@ def query_solar_window(preset: Optional[str] = None,
                     SELECT time_stamp, device_id, solar
                     FROM solar_data
                     WHERE device_id = %s AND time_stamp >= %s AND time_stamp <= %s
-                    ORDER BY time_stamp ASC
+                    ORDER BY time_stamp DESC
                     LIMIT %s;
                 """, (device_id, s, e, max_points))
 

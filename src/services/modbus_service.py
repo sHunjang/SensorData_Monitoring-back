@@ -90,7 +90,7 @@ def query_modbus_window(device_id: int,
       FROM modbus_data
       WHERE device_id = %s AND time_stamp BETWEEN %s AND %s
       GROUP BY bucket
-      ORDER BY bucket ASC
+      ORDER BY bucket DESC
       LIMIT %s;
     """
     params = [bucket, device_id, s, e, max_points]
@@ -187,7 +187,7 @@ def get_today_energy_kwh(device_id: int):
 
         # fallback: try alternate column name e_kwh
         cur.execute("""
-            SELECT MIN(e_kwh) AS mn, MAX(e_kwh) AS mx
+            SELECT MIN(total_active_energy_kwh) AS mn, MAX(total_active_energy_kwh) AS mx
             FROM modbus_data
             WHERE device_id=%s AND time_stamp >= %s AND time_stamp < %s
         """, (device_id, start_utc, end_utc))
