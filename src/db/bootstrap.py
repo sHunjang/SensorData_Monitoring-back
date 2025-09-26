@@ -56,7 +56,7 @@ CREATE INDEX IF NOT EXISTS idx_env_device_time ON env_data(device_id, time_stamp
 CREATE TABLE IF NOT EXISTS solar_data (
   time_stamp TIMESTAMPTZ NOT NULL,
   device_id INT NOT NULL,
-  solar DOUBLE PRECISION
+  irradiance DOUBLE PRECISION
 );
 
 CREATE INDEX IF NOT EXISTS idx_solar_device_time ON solar_data(device_id, time_stamp DESC);

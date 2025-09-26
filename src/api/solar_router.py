@@ -76,7 +76,7 @@ def query_solar(
     try:
         with get_cursor() as cur:
             sql = """
-                SELECT time_stamp, device_id, solar
+                SELECT time_stamp, device_id, irradiance
                 FROM solar_data
                 WHERE time_stamp >= %s AND time_stamp <= %s
             """

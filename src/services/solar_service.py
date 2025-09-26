@@ -36,7 +36,7 @@ def query_solar_window(preset: Optional[str] = None,
         with get_cursor() as cur:
             if device_id is None:
                 cur.execute("""
-                    SELECT time_stamp, device_id, solar
+                    SELECT time_stamp, device_id, irradiance
                     FROM solar_data
                     WHERE time_stamp >= %s AND time_stamp <= %s
                     ORDER BY time_stamp DESC
@@ -44,7 +44,7 @@ def query_solar_window(preset: Optional[str] = None,
                 """, (s, e, max_points))
             else:
                 cur.execute("""
-                    SELECT time_stamp, device_id, solar
+                    SELECT time_stamp, device_id, irradiance
                     FROM solar_data
                     WHERE device_id = %s AND time_stamp >= %s AND time_stamp <= %s
                     ORDER BY time_stamp DESC
