@@ -17,81 +17,66 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Dict
-
 from src.config.settings import settings
 from src.db.client import get_cursor
-from src.sensors.modbus_reader import create_instrument, read_summary  # reader 구현 의존
+from src.sensors.modbus_reader import create_instrument, read_summary
 
 log = logging.getLogger("modbus_collector")
 KST = ZoneInfo("Asia/Seoul")
 
 
 def ensure_table():
-    """
-    최소한의 테이블 및 칼럼을 보장.
-    - 기존 DB에 안전하게 적용되도록 ADD COLUMN IF NOT EXISTS 사용.
-    - 운영 환경에서 스키마 변경은 신중히 적용할 것.
-    """
+    """DB 테이블 생성 - 새 스키마에 맞춤"""
     with get_cursor() as cur:
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS modbus_data (
-            time_stamp TIMESTAMPTZ NOT NULL,
-            device_id INT NOT NULL
-        );
+            CREATE TABLE IF NOT EXISTS modbus_data (
+                time_stamp TIMESTAMPTZ NOT NULL,
+                device_id INT NOT NULL,
+                avg_line_to_line_volts_v DOUBLE PRECISION,
+                avg_line_to_neutral_volts_v DOUBLE PRECISION,
+                sum_line_currents_a DOUBLE PRECISION,
+                total_active_power_kw DOUBLE PRECISION,
+                total_reactive_power_kvar DOUBLE PRECISION,
+                total_apparent_power_kva DOUBLE PRECISION,
+                total_power_factor DOUBLE PRECISION,
+                total_active_energy_kwh DOUBLE PRECISION,
+                total_reactive_energy_kvarh DOUBLE PRECISION,
+                total_apparent_energy_kvah DOUBLE PRECISION
+            )
         """)
-        # 필요한 컬럼을 추가로 보장
-        cur.execute("ALTER TABLE modbus_data ADD COLUMN IF NOT EXISTS avg_line_to_line_volts_v DOUBLE PRECISION;")
-        cur.execute("ALTER TABLE modbus_data ADD COLUMN IF NOT EXISTS avg_line_to_neutral_volts_v DOUBLE PRECISION;")
-        cur.execute("ALTER TABLE modbus_data ADD COLUMN IF NOT EXISTS sum_line_currents_a DOUBLE PRECISION;")
-        cur.execute("ALTER TABLE modbus_data ADD COLUMN IF NOT EXISTS total_active_power_kw DOUBLE PRECISION;")
-        cur.execute("ALTER TABLE modbus_data ADD COLUMN IF NOT EXISTS total_reactive_power_kvar DOUBLE PRECISION;")
-        cur.execute("ALTER TABLE modbus_data ADD COLUMN IF NOT EXISTS total_apparent_power_kva DOUBLE PRECISION;")
-        cur.execute("ALTER TABLE modbus_data ADD COLUMN IF NOT EXISTS total_power_factor DOUBLE PRECISION;")
-        cur.execute("ALTER TABLE modbus_data ADD COLUMN IF NOT EXISTS total_active_energy_kwh DOUBLE PRECISION;")
-        cur.execute("ALTER TABLE modbus_data ADD COLUMN IF NOT EXISTS total_reactive_energy_kvarh DOUBLE PRECISION;")
-        cur.execute("ALTER TABLE modbus_data ADD COLUMN IF NOT EXISTS total_apparent_energy_kvah DOUBLE PRECISION;")
-
 
 def insert_row(device_id: int, payload: Dict[str, float]):
-    """
-    DB에 한 행 삽입.
-    - payload는 read_summary가 반환한 dict.
-    - 키가 없으면 None으로 넣음(방어적).
-    - 시간은 KST로 저장(타임존 일관성 유지).
-    """
+    """DB 삽입 - 새 스키마 적용"""
     now_kst = datetime.now(KST)
-
-    # reader가 반환할 것으로 기대되는 키들을 방어적으로 추출
-    ll_v = payload.get("avg_voltage_ll_v") or payload.get("avg_line_to_line_volts_v") or None
-    ln_v = payload.get("avg_voltage_ln_v") or payload.get("avg_line_to_neutral_volts_v") or None
-    i_sum = payload.get("sum_line_currents_a") or payload.get("sum_i") or None
-    p_kw = payload.get("total_active_kw") or payload.get("total_active_power_kw") or None
-    q_kvar = payload.get("total_reactive_power_kvar") or payload.get("q_kvar") or None
-    s_kva = payload.get("total_apparent_power_kva") or payload.get("s_kva") or None
+    
+    # payload 값 매핑 (기존 로직 유지)
+    llv = payload.get("avg_voltage_llv") or payload.get("avg_line_to_line_volts_v") or None
+    lnv = payload.get("avg_voltage_lnv") or payload.get("avg_line_to_neutral_volts_v") or None
+    isum = payload.get("sum_line_currents_a") or payload.get("sum_i") or None
+    pkw = payload.get("total_active_kw") or payload.get("total_active_power_kw") or None
+    qkvar = payload.get("total_reactive_power_kvar") or payload.get("q_kvar") or None
+    skva = payload.get("total_apparent_power_kva") or payload.get("s_kva") or None
     pf = payload.get("total_power_factor") or payload.get("pf") or None
-    e_kwh = payload.get("total_active_energy_kwh") or payload.get("e_kwh") or None
-    e_rea = payload.get("total_reactive_energy_kvarh") or payload.get("e_reactive") or None
-    e_app = payload.get("total_apparent_energy_kvah") or payload.get("e_apparent") or None
-
+    ekwh = payload.get("total_active_energy_kwh") or payload.get("e_kwh") or None
+    erea = payload.get("total_reactive_energy_kvarh") or payload.get("e_reactive") or None
+    eapp = payload.get("total_apparent_energy_kvah") or payload.get("e_apparent") or None
+    
     try:
         with get_cursor() as cur:
+            # 🔥 새 테이블명과 컬럼명 사용
             cur.execute("""
-            INSERT INTO modbus_data (
-                time_stamp, device_id,
-                avg_line_to_line_volts_v, avg_line_to_neutral_volts_v,
-                sum_line_currents_a, total_active_power_kw, total_reactive_power_kvar,
-                total_apparent_power_kva, total_power_factor,
-                total_active_energy_kwh, total_reactive_energy_kvarh, total_apparent_energy_kvah
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """, (
-                now_kst, device_id,
-                ll_v, ln_v,
-                i_sum, p_kw, q_kvar,
-                s_kva, pf,
-                e_kwh, e_rea, e_app
-            ))
+                INSERT INTO modbus_data (
+                    time_stamp, device_id,
+                    avg_line_to_line_volts_v, avg_line_to_neutral_volts_v,
+                    sum_line_currents_a, total_active_power_kw,
+                    total_reactive_power_kvar, total_apparent_power_kva,
+                    total_power_factor, total_active_energy_kwh,
+                    total_reactive_energy_kvarh, total_apparent_energy_kvah
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (now_kst, device_id, llv, lnv, isum, pkw, qkvar, skva, pf, ekwh, erea, eapp))
     except Exception:
         log.exception("DB insert failed for device=%s payload=%s", device_id, payload)
+
 
 
 def run_once_for_device(device_id: int, fail_counts: dict):

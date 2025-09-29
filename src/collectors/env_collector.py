@@ -33,37 +33,29 @@ KST = ZoneInfo("Asia/Seoul")
 
 
 def ensure_table():
-    """
-    env_data 테이블이 없으면 생성하고 주요 컬럼을 보장합니다.
-    운영 환경에서는 마이그레이션 도구(예: alembic)를 추천합니다.
-    """
+    """env_data 테이블 생성 - 새 스키마"""
     with get_cursor() as cur:
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS env_data (
-            time_stamp TIMESTAMPTZ NOT NULL,
-            device_id INT NOT NULL
-        );
+            CREATE TABLE IF NOT EXISTS env_data (
+                time_stamp TIMESTAMPTZ NOT NULL,
+                device_id INT NOT NULL,
+                temperature DOUBLE PRECISION,
+                humidity DOUBLE PRECISION
+            )
         """)
-        # 컬럼 안전 추가
-        cur.execute("ALTER TABLE env_data ADD COLUMN IF NOT EXISTS temperature DOUBLE PRECISION;")
-        cur.execute("ALTER TABLE env_data ADD COLUMN IF NOT EXISTS humidity DOUBLE PRECISION;")
-
 
 def insert_row(device_id: int, payload: Dict[str, float]):
-    """
-    단일 행 DB 삽입.
-    - payload는 read_env_sensor 반환 dict(방어적 추출)
-    - 시간은 KST로 저장
-    """
+    """DB 삽입 - 새 스키마"""
     now_kst = datetime.now(KST)
     temp = payload.get("temperature") or payload.get("temp") or None
     hum = payload.get("humidity") or payload.get("humidity") or None
-
+    
     try:
         with get_cursor() as cur:
+            # 🔥 새 테이블명과 컬럼명
             cur.execute("""
-            INSERT INTO env_data (time_stamp, device_id, temperature, humidity)
-            VALUES (%s, %s, %s, %s)
+                INSERT INTO env_data (time_stamp, device_id, temperature, humidity) 
+                VALUES (%s, %s, %s, %s)
             """, (now_kst, device_id, temp, hum))
     except Exception:
         log.exception("env DB insert failed for device=%s payload=%s", device_id, payload)

@@ -42,7 +42,7 @@ class Settings:
     cors_origins: Optional[str] = os.getenv("CORS_ORIGINS", "").strip() or None
 
     # Postgres DSN
-    PG_DSN: str = os.getenv("PG_DSN", "postgresql://postgres:postgres@127.0.0.1:5432/energy")
+    PG_DSN: str = os.getenv("PG_DSN", "postgresql://postgres:1234@127.0.0.1:5432/energydb")
 
     # 로깅 레벨
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()

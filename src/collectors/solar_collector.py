@@ -30,36 +30,27 @@ KST = ZoneInfo("Asia/Seoul")
 
 
 def ensure_table():
-    """
-    solar_data 테이블 생성(없으면) 및 주요 컬럼 보장.
-    운영에서는 마이그레이션 툴을 사용할 것을 권장.
-    """
+    """solar_data 테이블 생성 - 새 스키마"""
     with get_cursor() as cur:
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS solar_data (
-            time_stamp TIMESTAMPTZ NOT NULL,
-            device_id INT NOT NULL
-        );
+            CREATE TABLE IF NOT EXISTS solar_data (
+                time_stamp TIMESTAMPTZ NOT NULL,
+                device_id INT NOT NULL,
+                irradiance DOUBLE PRECISION
+            )
         """)
-        # 안전하게 컬럼 추가
-        cur.execute("ALTER TABLE solar_data ADD COLUMN IF NOT EXISTS irradiance DOUBLE PRECISION;")
-
 
 def insert_row(device_id: int, payload: Dict[str, float]):
-    """
-    단일 행을 solar_data에 삽입.
-    - payload는 read_solar_sensor가 반환한 dict.
-    - 없는 값은 NULL로 삽입.
-    - 시간은 KST로 저장.
-    """
+    """DB 삽입 - 새 스키마"""
     now_kst = datetime.now(KST)
-    irr = payload.get("irradiance_w_m2") or payload.get("irradiance") or None
-
+    irr = payload.get("irradiance_wm2") or payload.get("irradiance") or None
+    
     try:
         with get_cursor() as cur:
+            # 🔥 새 테이블명과 컬럼명
             cur.execute("""
-            INSERT INTO solar_data (time_stamp, device_id, irradiance)
-            VALUES (%s, %s, %s, %s)
+                INSERT INTO solar_data (time_stamp, device_id, irradiance) 
+                VALUES (%s, %s, %s)
             """, (now_kst, device_id, irr))
     except Exception:
         log.exception("solar DB insert failed for device=%s payload=%s", device_id, payload)
