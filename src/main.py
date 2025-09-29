@@ -185,7 +185,7 @@ async def lifespan(app: FastAPI):
             log.error(f"❌ DB 테이블 생성 실패: {e}")
     
     # ============= 2단계: 수집기 시작 (모드별 분기) =============
-    mode = os.getenv("MODE", "dummy").lower()
+    mode = os.getenv("MODE", "real").lower()
     log.info(f"🎛️  운영 모드: {mode}")
     
     if mode == "real" and REAL_COLLECTORS_LOADED:

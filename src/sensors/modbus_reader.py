@@ -11,7 +11,7 @@ TAC4300 Modbus reader (integer-format, FC=03, Holding Registers)
 import logging
 import time
 from typing import Tuple, Dict
-from pymodbus.client.sync import ModbusSerialClient
+from pymodbus.client import ModbusSerialClient
 from pymodbus.exceptions import ModbusException
 
 log = logging.getLogger("modbus_reader")
