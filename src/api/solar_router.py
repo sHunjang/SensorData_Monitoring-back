@@ -1,44 +1,38 @@
-"""
-solar_router.py - 태양광 일사량 데이터 API 라우터 (수정된 버전)
-
-주요 기능:
-- 4단계 preset 지원: 1h(1시간), 1d(1일), 1w(1주일), 1mo(1달)
-- 1주일/1달 preset에서 날짜별 집계로 X축 라벨 중복 문제 해결
-- 기존 client.py의 get_cursor() 사용
-"""
-
+# src/routes/solar_router.py
 from fastapi import APIRouter, Query, HTTPException
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict, Any
-from src.db.client import get_cursor  # 🔧 올바른 임포트 경로
+from typing import Optional, Dict, Any
+from src.db.client import get_cursor
 import logging
 
 router = APIRouter(prefix="/data/solar", tags=["solar"])
 logger = logging.getLogger(__name__)
 
+ALLOWED_PRESETS = {"10s", "1m", "15m", "1h", "1d", "1w", "1mo"}
+
 @router.get("/query")
 async def get_solar_data(
     deviceid: int = Query(..., description="Device ID (31)"),
-    preset: str = Query(..., description="Time preset: 1h, 1d, 1w, 1mo"),
+    preset: str = Query(..., description="Time preset: 10s,1m,15m,1h,1d,1w,1mo"),
     maxpoints: int = Query(100, description="Maximum data points"),
-    start: Optional[str] = Query(None, description="Start time (ISO format)"),
-    end: Optional[str] = Query(None, description="End time (ISO format)")
+    start: Optional[str] = Query(None), end: Optional[str] = Query(None)
 ) -> Dict[str, Any]:
-    """
-    태양광 일사량 데이터 조회 API
-    """
-    
+    if preset not in ALLOWED_PRESETS:
+        raise HTTPException(status_code=400, detail=f"Invalid preset: {preset}")
+
     try:
-        # 시간 범위 설정
         if start and end:
-            # 드릴다운: 특정 시간 범위
             start_time = datetime.fromisoformat(start.replace('Z', '+00:00'))
             end_time = datetime.fromisoformat(end.replace('Z', '+00:00'))
-            logger.info(f"태양광 드릴다운 모드: {start_time} ~ {end_time}")
         else:
-            # 기본 모드: preset에 따른 범위
             end_time = datetime.now(timezone.utc)
-            if preset == '1h':
+            if preset == '10s':
+                start_time = end_time - timedelta(seconds=10)
+            elif preset == '1m':
+                start_time = end_time - timedelta(minutes=1)
+            elif preset == '15m':
+                start_time = end_time - timedelta(minutes=15)
+            elif preset == '1h':
                 start_time = end_time - timedelta(hours=1)
             elif preset == '1d':
                 start_time = end_time - timedelta(days=1)
@@ -46,111 +40,55 @@ async def get_solar_data(
                 start_time = end_time - timedelta(days=7)
             elif preset == '1mo':
                 start_time = end_time - timedelta(days=30)
-            else:
-                raise HTTPException(status_code=400, detail=f"Invalid preset: {preset}")
-        
-        # 🔧 기존 client.py의 get_cursor() 사용
+
         with get_cursor() as cursor:
-            # 🔧 핵심 수정: preset별 집계 쿼리 (태양광 데이터용)
             if preset in ['1w', '1mo']:
-                # 1주일/1달: 날짜별 집계 (X축 라벨 중복 문제 해결)
                 query = """
-                SELECT 
-                    date_trunc('day', time_stamp) AS bucket,
-                    AVG(irradiance) AS irradiance
+                SELECT date_trunc('day', time_stamp) AS bucket, AVG(irradiance) AS irradiance
                 FROM solar_data
-                WHERE device_id = %s 
-                    AND time_stamp >= %s 
-                    AND time_stamp <= %s
-                GROUP BY 1
-                ORDER BY 1
-                LIMIT %s
+                WHERE device_id=%s AND time_stamp >= %s AND time_stamp <= %s
+                GROUP BY 1 ORDER BY 1 ASC LIMIT %s
                 """
-            else:
-                # 1시간/1일: 원본 데이터 (분/시간 단위)
-                if preset == '1h':
-                    # 1시간: 1분 간격 집계
-                    query = """
-                    SELECT 
-                        date_trunc('minute', time_stamp) AS bucket,
-                        AVG(irradiance) AS irradiance
-                    FROM solar_data
-                    WHERE device_id = %s 
-                        AND time_stamp >= %s 
-                        AND time_stamp <= %s
-                    GROUP BY 1
-                    ORDER BY 1
-                    LIMIT %s
-                    """
-                else:
-                    # 1일: 원본 데이터
-                    query = """
-                    SELECT 
-                        time_stamp AS bucket,
-                        irradiance
-                    FROM solar_data
-                    WHERE device_id = %s 
-                        AND time_stamp >= %s 
-                        AND time_stamp <= %s
-                    ORDER BY time_stamp DESC
-                    LIMIT %s
-                    """
-            
-            # 쿼리 실행
+            elif preset in ['15m', '1h']:
+                query = """
+                SELECT date_trunc('minute', time_stamp) AS bucket, AVG(irradiance) AS irradiance
+                FROM solar_data
+                WHERE device_id=%s AND time_stamp >= %s AND time_stamp <= %s
+                GROUP BY 1 ORDER BY 1 ASC LIMIT %s
+                """
+            elif preset == '10s':
+                query = """
+                SELECT to_timestamp(floor(EXTRACT(EPOCH FROM time_stamp)/10)*10) AT TIME ZONE 'UTC' AS bucket,
+                       AVG(irradiance) AS irradiance
+                FROM solar_data
+                WHERE device_id=%s AND time_stamp >= %s AND time_stamp <= %s
+                GROUP BY 1 ORDER BY 1 ASC LIMIT %s
+                """
+            else:  # '1m' or '1d' (1m treated as raw 1-minute window)
+                query = """
+                SELECT time_stamp AS bucket, irradiance
+                FROM solar_data
+                WHERE device_id=%s AND time_stamp >= %s AND time_stamp <= %s
+                ORDER BY time_stamp ASC LIMIT %s
+                """
+
             cursor.execute(query, (deviceid, start_time, end_time, maxpoints))
             rows = cursor.fetchall()
-            columns = [desc[0] for desc in cursor.description]
-            
-            # 결과 변환
+            cols = [d[0] for d in cursor.description]
+
             data = []
-            for row in rows:
-                row_dict = dict(zip(columns, row))
-                # bucket을 ISO 문자열로 변환
-                if row_dict['bucket']:
-                    row_dict['bucket'] = row_dict['bucket'].isoformat()
-                data.append(row_dict)
-        
-        logger.info(f"태양광 데이터 조회 완료: device={deviceid}, preset={preset}, count={len(data)}")
-        
-        return {
-            "data": data,
-            "count": len(data),
-            "preset": preset,
-            "device_id": deviceid,
-            "time_range": {
-                "start": start_time.isoformat(),
-                "end": end_time.isoformat()
-            }
-        }
-    
-    except Exception as e:
-        logger.error(f"태양광 데이터 조회 오류: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+            for r in rows:
+                rd = dict(zip(cols, r))
+                if rd.get('bucket'):
+                    try:
+                        rd['bucket'] = rd['bucket'].isoformat()
+                    except Exception:
+                        pass
+                data.append(rd)
 
-@router.get("/devices")
-async def get_solar_devices() -> Dict[str, Any]:
-    """사용 가능한 태양광 센서 장치 목록 반환"""
-    try:
-        with get_cursor() as cursor:
-            cursor.execute("""
-                SELECT DISTINCT device_id 
-                FROM solar_data 
-                WHERE device_id = 31
-                ORDER BY device_id
-            """)
-            
-            device_ids = [row[0] for row in cursor.fetchall()]
-        
-        return {
-            "devices": device_ids,
-            "count": len(device_ids)
-        }
-    
-    except Exception as e:
-        logger.error(f"태양광 장치 목록 조회 오류: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"data": data, "count": len(data), "preset": preset, "device_id": deviceid,
+                "time_range": {"start": start_time.isoformat(), "end": end_time.isoformat()}}
 
-@router.get("/health")
-async def health_check() -> Dict[str, str]:
-    """태양광 API 상태 확인"""
-    return {"status": "ok", "service": "solar"}
+    except Exception as e:
+        logger.error(f"Solar 에러: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
