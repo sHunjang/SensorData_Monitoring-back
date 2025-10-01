@@ -24,7 +24,7 @@ def ensure_table():
             CREATE TABLE IF NOT EXISTS solar_data (
                 time_stamp TIMESTAMPTZ NOT NULL,
                 device_id INT NOT NULL,
-                irradiance DOUBLE PRECISION
+                solar DOUBLE PRECISION
             )
         """)
 
@@ -33,7 +33,7 @@ def insert_row(device_id: int, value: float):
     now = datetime.now(KST)
     with get_cursor() as cur:
         cur.execute("""
-            INSERT INTO solar_data (time_stamp, device_id, irradiance)
+            INSERT INTO solar_data (time_stamp, device_id, solar)
             VALUES (%s, %s, %s)
         """, (now, device_id, value))
 
@@ -65,7 +65,7 @@ def run_collector(interval: Optional[int] = None, device_ids: Optional[List[int]
                 insert_row(sid, val)
                 last_vals[sid] = val
                 fail_counts[sid] = 0
-                log.info(f"☀️ dummy_solar: id={sid} irradiance={val} W/m²")
+                log.info(f"☀️ dummy_solar: id={sid} solar={val} W/m²")
             except Exception as e:
                 fail_counts[sid] += 1
                 log.exception(f"❌ dummy_solar: id={sid} insert failed ({fail_counts[sid]}/{MAX_FAILS}): {e}")

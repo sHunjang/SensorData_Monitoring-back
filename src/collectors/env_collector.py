@@ -76,7 +76,7 @@ def run_once_for_device(device_id: int, fail_counts: dict):
             raise RuntimeError(f"read_env_sensor returned non-dict: {data}")
 
         insert_row(device_id, data)
-        log.info("env: device=%s stored temp=%s hum=%s", device_id, data.get("temperature"), data.get("humidity"))
+        log.info("env: device=%s stored temp=%.2f hum=%.2f", device_id, data.get("temperature"), data.get("humidity"))
         fail_counts[device_id] = 0
     except Exception as e:
         fail_counts[device_id] = fail_counts.get(device_id, 0) + 1

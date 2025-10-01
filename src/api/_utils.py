@@ -35,26 +35,20 @@ def make_query_response(window_start: Optional[datetime],
                         stats: Optional[Dict[str, Any]] = None,
                         error: Optional[str] = None) -> Dict[str, Any]:
     """
-    통일된 쿼리 응답 포맷.
-    - window_start/window_end: datetime (UTC or tz-aware). 반환은 iso_kst로 KST 표기.
-    - bucket_label: "1 minute", "5 minutes" 등 (프론트의 버킷 해석 힌트)
-    - series: 시리즈 키 목록
-    - data: 리스트(각 항목은 'bucket' 포함). 'bucket'이 이미 tz-aware ISO이면 그대로 사용 가능.
-    - stats: 요약 통계
-    - error: 에러 메시지(있으면 비어있는 data로 응답)
+    프론트엔드 호환 쿼리 응답 포맷
+    - window_start/window_end를 최상위 레벨에 배치
+    - SolarContainer.tsx와 완벽 호환되는 구조
     """
     return {
-        "window": {
-            "start": iso_kst(window_start) if window_start else None,
-            "end": iso_kst(window_end) if window_end else None
-        },
-        "bucket": bucket_label,
+        # ✅ 프론트엔드가 기대하는 최상위 필드들
+        "window_start": iso_kst(window_start) if window_start else None,
+        "window_end": iso_kst(window_end) if window_end else None,
+        "bucket_label": bucket_label,
         "series": series,
         "data": data,
         "stats": stats or {},
         "error": error
     }
-
 
 def make_realtime_response(device_id: int,
                            time_stamp: Optional[Any],

@@ -218,8 +218,8 @@ async def lifespan(app: FastAPI):
         
         # 실제 센서 수집기들을 별도 쓰레드에서 실행
         threading.Thread(target=start_real_modbus, daemon=True, name="real_modbus").start()
-        threading.Thread(target=start_real_env, daemon=True, name="real_env").start()
-        threading.Thread(target=start_real_solar, daemon=True, name="real_solar").start()
+        # threading.Thread(target=start_real_env, daemon=True, name="real_env").start()
+        # threading.Thread(target=start_real_solar, daemon=True, name="real_solar").start()
         
         log.info("🔌 모든 실제 센서 수집기 시작됨")
         

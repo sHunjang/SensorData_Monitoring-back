@@ -1,40 +1,36 @@
-# test_pymodbus_install.py - 설치 확인
+import minimalmodbus, serial
+from typing import List
 
-def test_pymodbus_installation():
-    """pymodbus 설치 상태 확인"""
-    
-    print("🔍 pymodbus 설치 상태 확인...")
-    
+def create_instrument(port: str = "COM4", slave_id: int = 11):
+    """
+    Modbus RTU 통신용 Instrument 객체 생성
+    - port: COM 포트
+    - slave_id: 장치 주소 (TAC4300CT 메뉴얼 기본은 11)
+    """
+    inst = minimalmodbus.Instrument(port, slave_id)
+    inst.serial.baudrate = 9600
+    inst.serial.bytesize = 8
+    inst.serial.parity = serial.PARITY_NONE
+    inst.serial.stopbits = 1
+    inst.serial.timeout = 1
+    inst.clear_buffers_before_each_transaction = True
+    return inst
+
+device_ids: List[int] = [11, 12, 13, 14, 15]
+
+for sid in device_ids:
+    inst = create_instrument(port="COM4", slave_id=sid)
     try:
-        # v3.x 방식 시도
-        from pymodbus.client import ModbusSerialClient
-        print("✅ pymodbus v3.x 설치 확인됨")
-        
-        # 버전 확인
-        import pymodbus
-        version = getattr(pymodbus, '__version__', '버전 불명')
-        print(f"📦 pymodbus 버전: {version}")
-        
-        # 클라이언트 생성 테스트
-        client = ModbusSerialClient(port='COM1', baudrate=9600, timeout=1)
-        print("✅ ModbusSerialClient 생성 성공")
-        
-        return True
-        
-    except ImportError as e:
-        print(f"❌ pymodbus 설치 실패: {e}")
-        print("💡 해결책: pip install pymodbus==3.6.8")
-        return False
-    
+        print(f"Device {sid}")
+        print("ΣI:", inst.read_registers(0x0034, 2, functioncode=3))   # 합계 전류
+        print("Vavg:", inst.read_registers(0x0036, 2, functioncode=3)) # 평균 전압
+        print("Ptot:", inst.read_registers(0x002C, 2, functioncode=3)) # 총 유효전력
+        print("Energy:", inst.read_registers(0x0404, 2, functioncode=3)) # 전력량
+        print("Reg1:", inst.read_registers(0x002E, 2, functioncode=3))
+        print("Reg2:", inst.read_registers(0x0032, 2, functioncode=3))
+        print("Reg3:", inst.read_registers(0x040C, 2, functioncode=3))
+        print("Reg4:", inst.read_registers(0x0410, 2, functioncode=3))
+        print("Reg5:", inst.read_registers(0x0030, 2, functioncode=3))
+        print()
     except Exception as e:
-        print(f"⚠️  pymodbus 설치되었으나 문제 발생: {e}")
-        return False
-
-if __name__ == "__main__":
-    if test_pymodbus_installation():
-        print("\n🎉 pymodbus 설치 및 설정 완료!")
-        print("이제 MODE=real로 설정하여 실제 장비와 통신할 수 있습니다.")
-    else:
-        print("\n❌ pymodbus 설치에 문제가 있습니다.")
-        print("Miniconda 환경에서 다음 명령어를 실행하세요:")
-        print("pip install pymodbus==3.6.8 pyserial==3.5")
+        print(f"Device {sid} error:", e)
