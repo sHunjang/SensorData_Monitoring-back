@@ -218,8 +218,8 @@ async def lifespan(app: FastAPI):
         
         # 실제 센서 수집기들을 별도 쓰레드에서 실행
         threading.Thread(target=start_real_modbus, daemon=True, name="real_modbus").start()
-        # threading.Thread(target=start_real_env, daemon=True, name="real_env").start()
-        # threading.Thread(target=start_real_solar, daemon=True, name="real_solar").start()
+        threading.Thread(target=start_real_env, daemon=True, name="real_env").start()
+        threading.Thread(target=start_real_solar, daemon=True, name="real_solar").start()
         
         log.info("🔌 모든 실제 센서 수집기 시작됨")
         
@@ -317,7 +317,7 @@ async def lifespan(app: FastAPI):
             log.warning(f"⚠️  브라우저 자동 실행 실패: {e}")
     
     # 브라우저 실행을 별도 쓰레드에서 수행 (메인 서버 시작을 방해하지 않도록)
-    threading.Thread(target=open_browser, daemon=True, name="browser").start()
+    # threading.Thread(target=open_browser, daemon=True, name="browser").start()
     
     log.info("🚀 센서 모니터링 시스템 시작 완료")
     

@@ -1,125 +1,159 @@
-# src/api/env_router.py
 """
-/data/env/query
-- 목적:
-    온도/습도 시계열 조회. solar_router.py에서 적용한 개선사항들을 동일하게 적용.
-- 특징:
-    - start/end ISO 문자열에 'Z' 포함되어도 안전하게 파싱.
-    - device_id 또는 deviceId 둘 다 수용.
-    - max_points 서버측 cap 적용.
-    - 반환: make_query_response 형식. bucket 값은 KST tz-aware ISO.
+env_router.py - 환경 데이터(온도/습도) API 라우터 (수정된 버전)
+
+주요 기능:
+- 4단계 preset 지원: 1h(1시간), 1d(1일), 1w(1주일), 1mo(1달)
+- 1주일/1달 preset에서 날짜별 집계로 X축 라벨 중복 문제 해결
+- 기존 client.py의 get_cursor() 사용
 """
 
 from fastapi import APIRouter, Query, HTTPException
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
-from datetime import datetime, timezone, timedelta
-from src.db.client import get_cursor
-from src.api._utils import make_query_response, iso_kst
+from src.db.client import get_cursor  # 🔧 올바른 임포트 경로
+import logging
 
 router = APIRouter(prefix="/data/env", tags=["env"])
-
-SERVER_MAX_POINTS = 5000
-DEFAULT_POINTS = 500
-
-def parse_iso_flexible(s: str) -> datetime:
-    if s is None:
-        raise ValueError("empty")
-    s = s.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-def resolve_window(preset: Optional[str], start: Optional[str], end: Optional[str]):
-    now = datetime.now(timezone.utc)
-    if preset and not (start or end):
-        if preset == "15m": return now - timedelta(minutes=15), now, "1 minute"
-        if preset == "1h":  return now - timedelta(hours=1), now, "5 minutes"
-        if preset == "1d":  return now - timedelta(days=1), now, "1 hour"
-        if preset == "1w":  return now - timedelta(weeks=1), now, "6 hours"
-        if preset == "1mo": return now - timedelta(days=30), now, "1 day"
-
-    try:
-        s = parse_iso_flexible(start) if start else (now - timedelta(hours=1))
-        e = parse_iso_flexible(end) if end else now
-    except Exception as ex:
-        raise ValueError(f"invalid start/end datetime: {ex}")
-
-    if s.tzinfo is None: s = s.replace(tzinfo=timezone.utc)
-    if e.tzinfo is None: e = e.replace(tzinfo=timezone.utc)
-    return s.astimezone(timezone.utc), e.astimezone(timezone.utc), "1 hour"
+logger = logging.getLogger(__name__)
 
 @router.get("/query")
-def query_env(
-    preset: Optional[str] = Query(None),
-    start: Optional[str] = Query(None),
-    end: Optional[str] = Query(None),
-    max_points: Optional[int] = Query(None),
-    device_id: Optional[int] = Query(None),
-    deviceId: Optional[int] = Query(None),
-):
+async def get_env_data(
+    deviceid: int = Query(..., description="Device ID (21-23)"),
+    preset: str = Query(..., description="Time preset: 1h, 1d, 1w, 1mo"),
+    maxpoints: int = Query(100, description="Maximum data points"),
+    start: Optional[str] = Query(None, description="Start time (ISO format)"),
+    end: Optional[str] = Query(None, description="End time (ISO format)")
+) -> Dict[str, Any]:
     """
-    안전한 온/습도 시계열 조회.
-    - device_id/deviceId 지원
-    - max_points 서버 cap 적용
+    환경 데이터 조회 API
     """
-    dev_id = device_id if device_id is not None else deviceId
-
-    if max_points is None:
-        max_points = DEFAULT_POINTS
+    
     try:
-        max_points = int(max_points)
-    except Exception:
-        max_points = DEFAULT_POINTS
-    if max_points < 1:
-        max_points = DEFAULT_POINTS
-    if max_points > SERVER_MAX_POINTS:
-        max_points = SERVER_MAX_POINTS
-
-    try:
-        s, e, bucket = resolve_window(preset, start, end)
-    except ValueError as ex:
-        raise HTTPException(status_code=400, detail=str(ex))
-
-    try:
-        with get_cursor() as cur:
-            sql = """
-                SELECT time_stamp, device_id, temperature, humidity
+        # 시간 범위 설정
+        if start and end:
+            # 드릴다운: 특정 시간 범위
+            start_time = datetime.fromisoformat(start.replace('Z', '+00:00'))
+            end_time = datetime.fromisoformat(end.replace('Z', '+00:00'))
+            logger.info(f"환경 드릴다운 모드: {start_time} ~ {end_time}")
+        else:
+            # 기본 모드: preset에 따른 범위
+            end_time = datetime.now(timezone.utc)
+            if preset == '1h':
+                start_time = end_time - timedelta(hours=1)
+            elif preset == '1d':
+                start_time = end_time - timedelta(days=1)
+            elif preset == '1w':
+                start_time = end_time - timedelta(days=7)
+            elif preset == '1mo':
+                start_time = end_time - timedelta(days=30)
+            else:
+                raise HTTPException(status_code=400, detail=f"Invalid preset: {preset}")
+        
+        # 🔧 기존 client.py의 get_cursor() 사용
+        with get_cursor() as cursor:
+            # 🔧 핵심 수정: preset별 집계 쿼리 (환경 데이터용)
+            if preset in ['1w', '1mo']:
+                # 1주일/1달: 날짜별 집계 (X축 라벨 중복 문제 해결)
+                query = """
+                SELECT 
+                    date_trunc('day', time_stamp) AS bucket,
+                    AVG(temperature) AS temperature,
+                    AVG(humidity) AS humidity
                 FROM env_data
-                WHERE time_stamp >= %s AND time_stamp <= %s
-            """
-            params: List[Any] = [s, e]
-            if dev_id is not None:
-                sql += " AND device_id = %s"
-                params.append(dev_id)
-            sql += " ORDER BY time_stamp DESC LIMIT %s"
-            params.append(max_points)
-
-            cur.execute(sql, tuple(params))
-            rows: List[Dict[str, Any]] = []
-            for ts, dev, temp, hum in cur.fetchall():
-                rows.append({
-                    "bucket": iso_kst(ts) if ts else None,
-                    "device_id": dev,
-                    "temperature": temp,
-                    "humidity": hum,
-                })
-
-        # stats for temperature & humidity
-        def make_stat(key: str):
-            vals = [r[key] for r in rows if r.get(key) is not None]
-            return {
-                "avg": (sum(vals) / len(vals)) if vals else None,
-                "max": max(vals) if vals else None,
-                "min": min(vals) if vals else None,
-                "count": len(vals),
+                WHERE device_id = %s 
+                    AND time_stamp >= %s 
+                    AND time_stamp <= %s
+                GROUP BY 1
+                ORDER BY 1
+                LIMIT %s
+                """
+            else:
+                # 1시간/1일: 원본 데이터 (분/시간 단위)
+                if preset == '1h':
+                    # 1시간: 1분 간격 집계
+                    query = """
+                    SELECT 
+                        date_trunc('minute', time_stamp) AS bucket,
+                        AVG(temperature) AS temperature,
+                        AVG(humidity) AS humidity
+                    FROM env_data
+                    WHERE device_id = %s 
+                        AND time_stamp >= %s 
+                        AND time_stamp <= %s
+                    GROUP BY 1
+                    ORDER BY 1
+                    LIMIT %s
+                    """
+                else:
+                    # 1일: 원본 데이터
+                    query = """
+                    SELECT 
+                        time_stamp AS bucket,
+                        temperature,
+                        humidity
+                    FROM env_data
+                    WHERE device_id = %s 
+                        AND time_stamp >= %s 
+                        AND time_stamp <= %s
+                    ORDER BY time_stamp DESC
+                    LIMIT %s
+                    """
+            
+            # 쿼리 실행
+            cursor.execute(query, (deviceid, start_time, end_time, maxpoints))
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            
+            # 결과 변환
+            data = []
+            for row in rows:
+                row_dict = dict(zip(columns, row))
+                # bucket을 ISO 문자열로 변환
+                if row_dict['bucket']:
+                    row_dict['bucket'] = row_dict['bucket'].isoformat()
+                data.append(row_dict)
+        
+        logger.info(f"환경 데이터 조회 완료: device={deviceid}, preset={preset}, count={len(data)}")
+        
+        return {
+            "data": data,
+            "count": len(data),
+            "preset": preset,
+            "device_id": deviceid,
+            "time_range": {
+                "start": start_time.isoformat(),
+                "end": end_time.isoformat()
             }
+        }
+    
+    except Exception as e:
+        logger.error(f"환경 데이터 조회 오류: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-        stats = {"temperature": make_stat("temperature"), "humidity": make_stat("humidity")}
+@router.get("/devices")
+async def get_env_devices() -> Dict[str, Any]:
+    """사용 가능한 환경 센서 장치 목록 반환"""
+    try:
+        with get_cursor() as cursor:
+            cursor.execute("""
+                SELECT DISTINCT device_id 
+                FROM env_data 
+                WHERE device_id BETWEEN 21 AND 23
+                ORDER BY device_id
+            """)
+            
+            device_ids = [row[0] for row in cursor.fetchall()]
+        
+        return {
+            "devices": device_ids,
+            "count": len(device_ids)
+        }
+    
+    except Exception as e:
+        logger.error(f"환경 장치 목록 조회 오류: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-        return make_query_response(s, e, bucket, ["temperature", "humidity"], rows, stats)
-
-    except Exception as ex:
-        raise HTTPException(status_code=500, detail=str(ex))
+@router.get("/health")
+async def health_check() -> Dict[str, str]:
+    """환경 API 상태 확인"""
+    return {"status": "ok", "service": "env"}

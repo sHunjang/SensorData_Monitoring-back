@@ -24,7 +24,7 @@ def ensure_table():
             CREATE TABLE IF NOT EXISTS solar_data (
                 time_stamp TIMESTAMPTZ NOT NULL,
                 device_id INT NOT NULL,
-                solar DOUBLE PRECISION
+                irradiance DOUBLE PRECISION
             )
         """)
 
@@ -33,7 +33,7 @@ def insert_row(device_id: int, value: float):
     now = datetime.now(KST)
     with get_cursor() as cur:
         cur.execute("""
-            INSERT INTO solar_data (time_stamp, device_id, solar)
+            INSERT INTO solar_data (time_stamp, device_id, irradiance)
             VALUES (%s, %s, %s)
         """, (now, device_id, value))
 
