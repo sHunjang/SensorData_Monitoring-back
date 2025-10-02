@@ -1,0 +1,80 @@
+"""
+공통 API 유틸리티
+- make_query_response: 쿼리형(히스토리) 응답 표준화
+- make_realtime_response: 실시간 응답 표준화
+- iso_kst: datetime -> KST tz-aware ISO 문자열 변환 헬퍼
+"""
+
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
+
+KST = ZoneInfo("Asia/Seoul")
+
+
+def iso_kst(dt: Optional[datetime]) -> Optional[str]:
+    """
+    datetime -> KST tz-aware ISO string
+    - 입력이 None이면 None 반환
+    - tz-aware이면 KST로 변환해 isoformat() 반환
+    - tz-naive이면 KST로 간주(=KST 적용) 후 isoformat() 반환
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        # naive timestamp: assume it's already KST-local time (original DB usage may vary)
+        return dt.replace(tzinfo=KST).isoformat()
+    return dt.astimezone(KST).isoformat()
+
+
+def make_query_response(window_start: Optional[datetime],
+                        window_end: Optional[datetime],
+                        bucket_label: str,
+                        series: List[str],
+                        data: List[Dict[str, Any]],
+                        stats: Optional[Dict[str, Any]] = None,
+                        error: Optional[str] = None) -> Dict[str, Any]:
+    """
+    프론트엔드 호환 쿼리 응답 포맷
+    - window_start/window_end를 최상위 레벨에 배치
+    - SolarContainer.tsx와 완벽 호환되는 구조
+    """
+    return {
+        # ✅ 프론트엔드가 기대하는 최상위 필드들
+        "window_start": iso_kst(window_start) if window_start else None,
+        "window_end": iso_kst(window_end) if window_end else None,
+        "bucket_label": bucket_label,
+        "series": series,
+        "data": data,
+        "stats": stats or {},
+        "error": error
+    }
+
+def make_realtime_response(device_id: int,
+                           time_stamp: Optional[Any],
+                           metrics: Dict[str, Any],
+                           raw: Optional[Any] = None) -> Dict[str, Any]:
+    """
+    실시간 응답 포맷.
+    - time_stamp는 datetime 또는 tz-aware 문자열 가능. 여기서는 iso_kst을 사용하려 시도함.
+    - metrics: p_kw, e_kwh 등 메트릭 딕셔너리
+    - raw: 원본 DB/서비스 레코드(디버깅용)
+    """
+    ts_iso = None
+    try:
+        if time_stamp is None:
+            ts_iso = None
+        elif isinstance(time_stamp, str):
+            # 이미 문자열일 경우 그대로 돌려주되, 클라이언트에서 parse 가능해야 함
+            ts_iso = time_stamp
+        else:
+            ts_iso = iso_kst(time_stamp)
+    except Exception:
+        ts_iso = None
+
+    return {
+        "device_id": device_id,
+        "time_stamp": ts_iso,
+        "metrics": metrics,
+        "raw": raw
+    }

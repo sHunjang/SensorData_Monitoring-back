@@ -1,0 +1,82 @@
+"""
+Solar 1-Minute 집계 스크립트 (Device 31)
+
+실행:
+  python src/db/aggregate_solar/aggregate_solar_1m.py --hours 168
+"""
+
+import os
+import sys
+import logging
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+if __name__ == '__main__':
+    project_root = Path(__file__).resolve().parent.parent.parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
+from src.db.client import get_cursor
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+log = logging.getLogger("agg_solar_1m")
+
+def get_aggregate_sql(start_time: datetime, end_time: datetime) -> str:
+    return f"""
+    INSERT INTO agg_solar_1m (
+        bucket, avg_irradiance, max_irradiance, min_irradiance, sample_count
+    )
+    SELECT
+        time_bucket('1 minute', time_stamp) AS bucket_1m,
+        AVG(irradiance),
+        MAX(irradiance),
+        MIN(irradiance),
+        COUNT(*) AS sample_count
+    FROM solar_data
+    WHERE time_stamp >= %s AND time_stamp < %s
+    GROUP BY bucket_1m
+    ON CONFLICT (bucket) DO UPDATE SET
+        avg_irradiance = EXCLUDED.avg_irradiance,
+        max_irradiance = EXCLUDED.max_irradiance,
+        min_irradiance = EXCLUDED.min_irradiance,
+        sample_count = EXCLUDED.sample_count;
+    """
+
+def aggregate(start_time: datetime, end_time: datetime) -> int:
+    sql = get_aggregate_sql(start_time, end_time)
+    try:
+        with get_cursor() as cur:
+            cur.execute(sql, (start_time, end_time))
+            row_count = cur.rowcount
+        log.info(f"Solar: {row_count} rows aggregated")
+        return row_count
+    except Exception as e:
+        log.error(f"Solar aggregation failed: {e}")
+        return 0
+
+def aggregate_all(hours: int = 24):
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(hours=hours)
+    
+    log.info("=" * 70)
+    log.info("Solar 1-Minute Aggregation")
+    log.info("=" * 70)
+    log.info(f"Period: {start_time} ~ {end_time}")
+    log.info("")
+    
+    rows = aggregate(start_time, end_time)
+    
+    log.info("")
+    log.info("=" * 70)
+    log.info(f"Total aggregated: {rows} rows")
+    log.info("=" * 70)
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Solar 1-Minute Aggregation")
+    parser.add_argument('--hours', type=int, default=24)
+    args = parser.parse_args()
+    aggregate_all(hours=args.hours)
+
+if __name__ == '__main__':
+    main()
