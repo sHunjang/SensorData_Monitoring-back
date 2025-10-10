@@ -54,7 +54,7 @@ def query_modbus_window(device_id: int,
                         preset: Optional[str] = None,
                         start: Optional[str] = None,
                         end: Optional[str] = None,
-                        max_points: int = 1000) -> Dict[str, Any]:
+                        max_points: int = 1) -> Dict[str, Any]:
     """
     윈도우 쿼리 수행 (집계 자동 선택)
     

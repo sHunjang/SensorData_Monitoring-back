@@ -1,146 +1,393 @@
-# src/sensors/env_reader.py
 """
-Env(온·습도) 센서 Modbus RTU 리더 (CWT-XYTH 기준)
+환경(온습도) 센서 통신 모듈
 
-요약
-- 레지스터: temperature @ 0x0000, humidity @ 0x0001 (각 16-bit).
-- 읽기 함수코드: 0x03 (Read Holding Registers). 예제 패킷도 0x03 사용함.
-- 스케일/오프셋 (매뉴얼 기준):
-    temperature_raw: 0 ~ 1650  -> 온도 -40 ~ 125°C
-      => temperature = temperature_raw * 0.1 - 40
-    humidity_raw: 0 ~ 1000 -> 0 ~ 100%RH
-      => humidity = humidity_raw * 0.1
-- 기본 통신 파라미터: 9600,n,8,1
-- 참고 매뉴얼(업로드한 PDF). :contentReference[oaicite:0]{index=0}
+이 모듈은 실제 Modbus RTU 프로토콜을 통해 온습도 센서와 통신하여
+환경 데이터를 읽어옵니다.
 
-사용법
-- create_instrument(port, slave_id, ...) 로 인스턴스 생성
-- read_env_sensor(inst) 호출해 {"temperature": float|None, "humidity": float|None} 반환
+주요 기능:
+    1. Modbus RTU 시리얼 통신
+    2. 온도/습도 센서 데이터 읽기
+    3. 5초 주기 데이터 수집
+    4. 메모리 버퍼 관리
+    5. 1분마다 자동 집계 및 DB 저장
+
+하드웨어 구성:
+    - 센서: Modbus RTU (RS485)
+    - 통신 방식: Serial (TTL/RS485 변환기 사용)
+    - 보드레이트: 9600 (기본값)
+
+Modbus 레지스터 맵 (예시):
+    - 온도: 0x0000 (0.1°C 단위)
+    - 습도: 0x0001 (0.1% 단위)
+
+사용법:
+    python -m src.collectors.env_reader
+
+작성일: 2025-10-10
 """
 
-from typing import Dict, Optional, Tuple
 import time
 import logging
+import statistics
+from datetime import datetime, timezone
+from collections import defaultdict
+from typing import Dict, List, Optional
 
-import minimalmodbus
-import serial
+try:
+    from pymodbus.client import ModbusSerialClient
+    from pymodbus.exceptions import ModbusException
+    MODBUS_AVAILABLE = True
+except ImportError:
+    MODBUS_AVAILABLE = False
+    logging.warning("⚠️  pymodbus not installed. Install with: pip install pymodbus")
+
+from src.db.client import get_cursor
+from src.config.settings import settings
 
 log = logging.getLogger("env_reader")
 
-# 기본 레지스터 맵 (매뉴얼 기준)
-# (register_address, decimals_for_minimalmodbus, signed_flag, scale, offset)
-# decimals is set to 0 because we read raw integer and apply scale/offset ourselves.
-DEFAULT_REGISTER_MAP = {
-    "temperature": (0x0000, 0, False, 0.1, -40.0),  # raw 0..1650 -> temp = raw*0.1 - 40
-    "humidity":    (0x0001, 0, False, 0.1, 0.0),    # raw 0..1000 -> rh = raw*0.1
-}
+# ========================================
+# 전역 변수
+# ========================================
+ENV_DEVICES = settings.ENV_IDS
+COLLECTION_INTERVAL = settings.COLLECTION_INTERVAL  # 5초
 
-DEFAULT_TIMEOUT = 1.0   # sec
-DEFAULT_RETRIES = 2     # 읽기 재시도 횟수
-DEFAULT_MODE = minimalmodbus.MODE_RTU
+# 메모리 버퍼: device_id별로 5초 데이터를 1분간 누적
+data_buffer: Dict[int, List[dict]] = defaultdict(list)
+
+# Modbus 클라이언트 (전역)
+modbus_client: Optional[ModbusSerialClient] = None
 
 
-def create_instrument(
-    port: str = "COM8",
-    slave_id: int = 21,
-    baudrate: int = 9600,
-    bytesize: int = 8,
-    parity: str = serial.PARITY_NONE,
-    stopbits: int = 1,
-    timeout: float = DEFAULT_TIMEOUT,
-    mode: str = DEFAULT_MODE,
-    clear_buffers_before_each_transaction: bool = True,
-) -> minimalmodbus.Instrument:
+# ========================================
+# Modbus 클라이언트 초기화
+# ========================================
+def init_modbus_client() -> Optional[ModbusSerialClient]:
     """
-    minimalmodbus.Instrument 생성기.
-    - 기본값은 COM8, 9600, timeout=1s (사용자의 .env 설정과 일치시킬 것).
-    - 반환 Instrument는 호출자가 사용 후 별도 close 필요 없음.
+    Modbus RTU 시리얼 클라이언트 초기화
+    
+    Returns:
+        ModbusSerialClient: 초기화된 클라이언트 또는 None
+    
+    설정:
+        - port: settings.ENV_PORT (예: /dev/ttyUSB1)
+        - baudrate: settings.ENV_BAUDRATE (기본: 9600)
+        - timeout: settings.ENV_TIMEOUT (기본: 1.0초)
     """
-    inst = minimalmodbus.Instrument(port, slave_id)
-    inst.serial.baudrate = baudrate
-    inst.serial.bytesize = bytesize
-    inst.serial.parity = parity
-    inst.serial.stopbits = stopbits
-    inst.serial.timeout = timeout
-    inst.mode = mode
-    inst.clear_buffers_before_each_transaction = clear_buffers_before_each_transaction
-    return inst
+    if not MODBUS_AVAILABLE:
+        log.error("❌ pymodbus not available")
+        return None
+    
+    try:
+        client = ModbusSerialClient(
+            port=settings.ENV_PORT,
+            baudrate=settings.ENV_BAUDRATE,
+            timeout=settings.ENV_TIMEOUT,
+            bytesize=8,
+            parity='N',
+            stopbits=1
+        )
+        
+        if client.connect():
+            log.info(f"✅ Env Modbus client connected: {settings.ENV_PORT}")
+            return client
+        else:
+            log.error(f"❌ Env Modbus connection failed: {settings.ENV_PORT}")
+            return None
+            
+    except Exception as e:
+        log.exception(f"❌ Env Modbus client initialization failed: {e}")
+        return None
 
 
-def _safe_read_register(
-    inst: minimalmodbus.Instrument,
-    register: int,
-    decimals: int,
-    signed: bool,
-    functioncode: int = 3,
-    retries: int = DEFAULT_RETRIES,
-    retry_delay: float = 0.05,
-) -> Optional[int]:
+# ========================================
+# Modbus 레지스터 읽기
+# ========================================
+def read_modbus_registers(
+    client: ModbusSerialClient,
+    device_id: int,
+    address: int,
+    count: int
+) -> Optional[List[int]]:
     """
-    minimalmodbus read_register 래퍼(재시도 포함).
-    - register: Holding register 주소 (0 기반)
-    - decimals: minimalmodbus 파라미터 (여기선 0으로 raw 정수 사용)
-    - signed: True면 signed 읽기
-    - functioncode: 기본 3 (Holding Registers)
-    - 반환: 정수 raw 값 또는 None (실패)
+    Modbus 홀딩 레지스터 읽기
+    
+    Args:
+        client: Modbus 클라이언트
+        device_id: 슬레이브 디바이스 ID (21-23)
+        address: 시작 레지스터 주소
+        count: 읽을 레지스터 개수
+    
+    Returns:
+        Optional[List[int]]: 레지스터 값 리스트 또는 None (실패 시)
     """
-    for attempt in range(retries + 1):
+    try:
+        response = client.read_holding_registers(
+            address=address,
+            count=count,
+            slave=device_id
+        )
+        
+        if response.isError():
+            log.error(f"❌ Modbus read error: device={device_id}, addr={address}")
+            return None
+        
+        return response.registers
+        
+    except ModbusException as e:
+        log.error(f"❌ Modbus exception: device={device_id}, {e}")
+        return None
+    except Exception as e:
+        log.error(f"❌ Unexpected error: device={device_id}, {e}")
+        return None
+
+
+# ========================================
+# 온습도 센서 데이터 읽기
+# ========================================
+def read_env_sensor_data(client: ModbusSerialClient, device_id: int) -> Optional[dict]:
+    """
+    온습도 센서에서 환경 데이터 읽기
+    
+    Args:
+        client: Modbus 클라이언트
+        device_id: 디바이스 ID (21-23)
+    
+    Returns:
+        Optional[dict]: 환경 데이터 또는 None (실패 시)
+            {
+                'device_id': int,
+                'timestamp': datetime,
+                'temperature_c': float,      # 온도 (섭씨)
+                'humidity_percent': float    # 습도 (%)
+            }
+    
+    레지스터 맵 (예시 - 실제 센서 매뉴얼 참고):
+        0x0000: 온도 (0.1°C 단위, signed)
+        0x0001: 습도 (0.1% 단위)
+    
+    주의:
+        - 레지스터 주소는 센서 모델마다 다를 수 있음
+        - 스케일 팩터는 매뉴얼 참고
+    """
+    try:
+        # ========================================
+        # 1. 온도/습도 레지스터 읽기 (2개)
+        # ========================================
+        regs = read_modbus_registers(client, device_id, 0x0000, 2)
+        if not regs:
+            return None
+        
+        # ========================================
+        # 2. 온도 변환 (signed 16-bit)
+        # ========================================
+        # 음수 처리: 0x8000 이상이면 음수로 변환
+        temp_raw = regs[0]
+        if temp_raw >= 0x8000:
+            temp_raw = temp_raw - 0x10000  # 2의 보수 변환
+        
+        temperature_c = temp_raw / 10.0  # 스케일 팩터: 10
+        
+        # ========================================
+        # 3. 습도 변환 (unsigned 16-bit)
+        # ========================================
+        humidity_percent = regs[1] / 10.0  # 스케일 팩터: 10
+        
+        # ========================================
+        # 4. 결과 데이터 구성
+        # ========================================
+        data = {
+            'device_id': device_id,
+            'timestamp': datetime.now(timezone.utc),
+            'temperature_c': round(temperature_c, 1),
+            'humidity_percent': round(humidity_percent, 1)
+        }
+        
+        return data
+        
+    except Exception as e:
+        log.error(f"❌ Failed to read env sensor {device_id}: {e}")
+        return None
+
+
+# ========================================
+# 5초 데이터 수집 (메모리 버퍼)
+# ========================================
+def collect_5s_data(client: ModbusSerialClient):
+    """
+    모든 Env 디바이스의 5초 데이터를 읽어 메모리 버퍼에 저장
+    
+    Args:
+        client: Modbus 클라이언트
+    
+    동작:
+        1. 각 device_id에 대해 온습도 데이터 읽기
+        2. 메모리 버퍼에 추가 (DB 저장 안함)
+        3. 실시간 API에서 이 버퍼를 읽어서 제공
+    """
+    for device_id in ENV_DEVICES:
+        data = read_env_sensor_data(client, device_id)
+        
+        if data:
+            data_buffer[device_id].append(data)
+            
+            log.debug(
+                f"📥 Device {device_id}: "
+                f"온도={data['temperature_c']:.1f}°C, "
+                f"습도={data['humidity_percent']:.1f}%"
+            )
+        else:
+            log.warning(f"⚠️  Device {device_id}: 데이터 읽기 실패")
+
+
+# ========================================
+# 1분마다 평균 계산 및 DB 저장
+# ========================================
+def flush_1m_aggregation():
+    """
+    1분마다 버퍼의 5초 데이터를 평균 계산하여 1분 테이블에 저장
+    
+    동작:
+        dummy_env_collector.py의 flush_1m_aggregation()과 동일
+        실제 장치에서 읽은 데이터를 집계하여 DB에 저장
+    """
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    
+    log.info(f"\n⏰ 1분 집계 시작: {now.isoformat()}")
+    
+    for device_id in ENV_DEVICES:
         try:
-            # minimalmodbus는 decimals 파라미터로 나누기를 수행하므로 decimals=0으로 raw 정수 수신
-            raw = inst.read_register(register, decimals, functioncode=functioncode, signed=signed)
-            # read_register may return float when decimals>0, but we use decimals=0 -> int/float raw
-            return int(raw)
+            rows = data_buffer[device_id]
+            
+            if not rows:
+                log.warning(f"  ⚠️  Device {device_id}: 버퍼 데이터 없음")
+                continue
+            
+            # 집계 계산
+            temps = [r['temperature_c'] for r in rows]
+            humids = [r['humidity_percent'] for r in rows]
+            
+            avg_temp = statistics.mean(temps)
+            max_temp = max(temps)
+            min_temp = min(temps)
+            
+            avg_humid = statistics.mean(humids)
+            max_humid = max(humids)
+            min_humid = min(humids)
+            
+            count = len(rows)
+            
+            # DB INSERT
+            with get_cursor() as cur:
+                cur.execute(f"""
+                    INSERT INTO env_data_{device_id}_1m (
+                        time_bucket,
+                        avg_temperature_c,
+                        max_temperature_c,
+                        min_temperature_c,
+                        avg_humidity_percent,
+                        max_humidity_percent,
+                        min_humidity_percent,
+                        count
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s
+                    )
+                    ON CONFLICT (time_bucket) DO UPDATE SET
+                        avg_temperature_c = EXCLUDED.avg_temperature_c,
+                        max_temperature_c = EXCLUDED.max_temperature_c,
+                        min_temperature_c = EXCLUDED.min_temperature_c,
+                        avg_humidity_percent = EXCLUDED.avg_humidity_percent,
+                        max_humidity_percent = EXCLUDED.max_humidity_percent,
+                        min_humidity_percent = EXCLUDED.min_humidity_percent,
+                        count = EXCLUDED.count;
+                """, (
+                    now, avg_temp, max_temp, min_temp,
+                    avg_humid, max_humid, min_humid, count
+                ))
+            
+            log.info(
+                f"  ✅ Device {device_id} 1분 집계 저장: "
+                f"온도={avg_temp:.1f}°C({min_temp:.1f}-{max_temp:.1f}), "
+                f"습도={avg_humid:.1f}%({min_humid:.1f}-{max_humid:.1f}), "
+                f"samples={count}"
+            )
+            
         except Exception as e:
-            log.debug("env_reader: read_register failed reg=%s unit=%s attempt=%s err=%s", register, inst.address, attempt, e)
-            time.sleep(retry_delay)
-    log.warning("env_reader: failed to read register %s unit=%s after %s attempts", register, inst.address, retries + 1)
-    return None
+            log.error(f"  ❌ Device {device_id} 1분 집계 실패: {e}")
+    
+    # 버퍼 클리어
+    data_buffer.clear()
+    log.info("🧹 버퍼 클리어 완료\n")
 
 
-def read_env_sensor(inst: minimalmodbus.Instrument, register_map: Dict[str, Tuple[int, int, bool, float, float]] = None) -> Dict[str, Optional[float]]:
+# ========================================
+# 메인 실행 루프
+# ========================================
+def run():
     """
-    센서에서 온도/습도를 읽어 dict로 반환.
-    - register_map 기본값은 DEFAULT_REGISTER_MAP (CWT-XYTH 매뉴얼 기준).
-    - 반환:
-        {"temperature": float|None, "humidity": float|None}
-    - 실패된 키는 None으로 반환.
+    Env Reader 메인 루프
+    
+    동작:
+        1. Modbus 클라이언트 초기화
+        2. 5초마다 데이터 수집 (메모리 버퍼)
+        3. 1분마다 집계 및 DB 저장
+        4. Ctrl+C로 종료 시 정상 종료
     """
-    if register_map is None:
-        register_map = DEFAULT_REGISTER_MAP
+    global modbus_client
+    
+    log.info("=" * 60)
+    log.info("🔌 Env Reader 시작")
+    log.info(f"   Port: {settings.ENV_PORT}")
+    log.info(f"   Baudrate: {settings.ENV_BAUDRATE}")
+    log.info(f"   Devices: {ENV_DEVICES}")
+    log.info("=" * 60)
+    
+    # Modbus 클라이언트 초기화
+    modbus_client = init_modbus_client()
+    if not modbus_client:
+        log.error("❌ Modbus 클라이언트 초기화 실패. 종료합니다.")
+        return
+    
+    # 마지막 집계 시각
+    last_flush_minute = datetime.now(timezone.utc).minute
+    
+    try:
+        while True:
+            # 5초 데이터 수집
+            collect_5s_data(modbus_client)
+            
+            # 1분 경과 확인
+            current_minute = datetime.now(timezone.utc).minute
+            if current_minute != last_flush_minute:
+                flush_1m_aggregation()
+                last_flush_minute = current_minute
+            
+            # 5초 대기
+            time.sleep(COLLECTION_INTERVAL)
+            
+    except KeyboardInterrupt:
+        log.info("\n🛑 Env Reader 종료 (사용자 요청)")
+    except Exception as e:
+        log.exception(f"❌ Env Reader 오류: {e}")
+    finally:
+        if modbus_client:
+            modbus_client.close()
+            log.info("🔌 Modbus 연결 종료")
 
-    out: Dict[str, Optional[float]] = {"temperature": None, "humidity": None}
 
-    # Temperature
-    if "temperature" in register_map:
-        reg, decimals, signed, scale, offset = register_map["temperature"]
-        raw = _safe_read_register(inst, reg, decimals, signed, functioncode=3)
-        if raw is not None:
-            try:
-                # 매뉴얼: raw 0..1650 -> -40..125  => temp = raw * 0.1 - 40
-                out["temperature"] = float(raw) * float(scale) + float(offset)
-            except Exception:
-                log.exception("env_reader: temperature scale conversion failed raw=%s scale=%s offset=%s", raw, scale, offset)
-                out["temperature"] = None
-
-    # Humidity
-    if "humidity" in register_map:
-        reg, decimals, signed, scale, offset = register_map["humidity"]
-        raw = _safe_read_register(inst, reg, decimals, signed, functioncode=3)
-        if raw is not None:
-            try:
-                out["humidity"] = float(raw) * float(scale) + float(offset)
-            except Exception:
-                log.exception("env_reader: humidity scale conversion failed raw=%s scale=%s offset=%s", raw, scale, offset)
-                out["humidity"] = None
-
-    return out
-
-
-def update_register_map(new_map: Dict[str, Tuple[int, int, bool, float, float]]):
+if __name__ == "__main__":
     """
-    런타임에 REGISTER_MAP을 덮어쓰기(테스트/현장 조정용).
-    new_map 형식: {"temperature": (addr,decimals,signed,scale,offset), ...}
+    직접 실행 시 Env 리더 시작
+    
+    사용법:
+        python -m src.collectors.env_reader
+    
+    요구사항:
+        pip install pymodbus
     """
-    global DEFAULT_REGISTER_MAP
-    DEFAULT_REGISTER_MAP = new_map.copy()
-    log.info("env_reader: DEFAULT_REGISTER_MAP updated: %s", DEFAULT_REGISTER_MAP)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    run()

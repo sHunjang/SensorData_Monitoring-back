@@ -1,50 +1,153 @@
-# src/api/health_router.py
 """
-Health check 라우터.
-- /health : 앱 상태, DB 접속 가능 여부(간단 쿼리) 반환.
-- 목적: 로드밸런서/모니터링의 기본 헬스엔드포인트와 수동 점검용.
-- 경량 구현: DB 접속은 get_connection()이 아닌 get_cursor()를 사용해
-  설정에 따라 dummy 모드에서도 안전하게 동작함.
+Health Check Router
+
+시스템 상태 및 설정 정보를 제공하는 엔드포인트
+
+작성일: 2025-10-10
 """
 
-from fastapi import APIRouter
-from fastapi.responses import JSONResponse
 import logging
+from datetime import datetime, timezone
+from typing import Dict, Any
 
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+from src.config.settings import settings
 from src.db.client import get_cursor
 
-router = APIRouter()
-log = logging.getLogger("api.health")
+log = logging.getLogger("health")
+
+router = APIRouter(tags=["Health"])
 
 
-@router.get("/health", tags=["health"])
-def health():
+# ========================================
+# Response Models
+# ========================================
+
+class HealthResponse(BaseModel):
+    """헬스 체크 응답 모델"""
+    status: str
+    timestamp: str
+    database: str
+    mode: str
+    devices: Dict[str, Any]
+
+
+# ========================================
+# Endpoints
+# ========================================
+
+@router.get("/health", response_model=HealthResponse)
+async def health_check():
     """
-    반환 예:
-      { "status": "ok", "db": True }
-      { "status": "fail", "db": False, "error": "..." }
-    - DB 체크는 간단한 SELECT 1 실행.
-    - 실패 시 에러 메시지를 포함하지만 민감정보(DSN) 노출 금지.
+    시스템 헬스 체크
+    
+    Returns:
+        HealthResponse: 시스템 상태 및 설정 정보
+        
+    Raises:
+        HTTPException: 데이터베이스 연결 실패 시 500 에러
+    
+    Example:
+        GET /health
+        
+        Response:
+        {
+            "status": "ok",
+            "timestamp": "2025-10-10T14:43:26.123Z",
+            "database": "connected",
+            "mode": "dummy",
+            "devices": {
+                "modbus_3w": [11, 12, 13],
+                "modbus_4w": [14, 15],
+                "env": [21, 22, 23],
+                "solar": 31
+            }
+        }
     """
-    db_ok = False
-    db_err = None
     try:
+        # 데이터베이스 연결 확인
         with get_cursor() as cur:
-            # get_cursor은 dummy 모드에서 DummyCursor를 반환할 수 있으므로 안전함
             cur.execute("SELECT 1")
-            # 일부 DummyCursor는 fetchone을 구현하지 않으므로 try/except 사용
-            try:
-                _ = cur.fetchone()
-            except Exception:
-                pass
-        db_ok = True
+            db_status = "connected"
     except Exception as e:
-        db_ok = False
-        db_err = str(e)
+        log.error(f"❌ Database connection failed: {e}")
+        db_status = "disconnected"
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database connection failed: {str(e)}"
+        )
+    
+    return {
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "database": db_status,
+        "mode": settings.MODE,
+        "devices": {
+            "modbus_3w": settings.MODBUS_3W_IDS,  # ✅ 수정: THREE_PHASE_THREE_WIRE_IDS → MODBUS_3W_IDS
+            "modbus_4w": settings.MODBUS_4W_IDS,  # ✅ 수정: THREE_PHASE_FOUR_WIRE_IDS → MODBUS_4W_IDS
+            "env": settings.ENV_IDS,
+            "solar": settings.SOLAR_ID,
+        }
+    }
 
-    status = "ok" if db_ok else "fail"
-    payload = {"status": status, "db": db_ok}
-    if db_err:
-        payload["error"] = db_err
 
-    return JSONResponse(content=payload)
+@router.get("/health/db")
+async def health_check_db():
+    """
+    데이터베이스 상세 헬스 체크
+    
+    Returns:
+        dict: 각 센서별 테이블 존재 여부 및 레코드 수
+        
+    Example:
+        GET /health/db
+        
+        Response:
+        {
+            "status": "ok",
+            "tables": {
+                "modbus_data_11_1m": {"exists": true, "count": 1234},
+                "env_data_21_1m": {"exists": true, "count": 567},
+                ...
+            }
+        }
+    """
+    try:
+        table_status = {}
+        
+        with get_cursor() as cur:
+            # Modbus 테이블 확인
+            all_modbus = settings.MODBUS_3W_IDS + settings.MODBUS_4W_IDS
+            for device_id in all_modbus:
+                table_name = f"modbus_data_{device_id}_1m"
+                cur.execute(f"SELECT COUNT(*) FROM {table_name}")
+                count = cur.fetchone()[0]
+                table_status[table_name] = {"exists": True, "count": count}
+            
+            # Env 테이블 확인
+            for device_id in settings.ENV_IDS:
+                table_name = f"env_data_{device_id}_1m"
+                cur.execute(f"SELECT COUNT(*) FROM {table_name}")
+                count = cur.fetchone()[0]
+                table_status[table_name] = {"exists": True, "count": count}
+            
+            # Solar 테이블 확인
+            table_name = f"solar_data_{settings.SOLAR_ID}_1m"
+            cur.execute(f"SELECT COUNT(*) FROM {table_name}")
+            count = cur.fetchone()[0]
+            table_status[table_name] = {"exists": True, "count": count}
+        
+        return {
+            "status": "ok",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "tables": table_status
+        }
+        
+    except Exception as e:
+        log.error(f"❌ Database health check failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database health check failed: {str(e)}"
+        )

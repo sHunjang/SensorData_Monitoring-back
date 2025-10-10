@@ -1,144 +1,371 @@
-# src/sensors/solar_reader.py
 """
-CWT-SI 일사량 센서(Modbus RTU) 리더
-- 매뉴얼 기반 반영:
-  - 읽기 레지스터: 0x0000 (1 워드, 16bit) -> irradiance (W/m^2), 분해능 1 W/m^2.
-  - 기본 통신: 4800, N, 8, 1 (매뉴얼 기본값). 기본 슬레이브 ID는 센서 설정에 따름.
-  - 읽기 함수코드: 0x03 (Read Holding Registers). 쓰기(보정) 예: 0x06.
-  - 매뉴얼: CWT-SI Solar irradiance sensor manual (RS485). :contentReference[oaicite:1]{index=1}
-- 동작:
-  - minimalmodbus 사용.
-  - 재시도/타임아웃/로깅 포함.
-  - read_solar_sensor(inst) -> {"irradiance_w_m2": float|None, "module_temp_c": float|None}
-  - write_calibration(inst, value) : 보정값(정수 W/m^2) 쓰기(레지스터 0x0052, function 0x06)
+일사량(Solar) 센서 통신 모듈
+
+이 모듈은 실제 Modbus RTU 프로토콜을 통해 일사량 센서와 통신하여
+일사량 데이터를 읽어옵니다.
+
+주요 기능:
+    1. Modbus RTU 시리얼 통신
+    2. 일사량 센서 데이터 읽기
+    3. 5초 주기 데이터 수집
+    4. 메모리 버퍼 관리
+    5. 1분마다 자동 집계 및 DB 저장
+
+하드웨어 구성:
+    - 센서: Modbus RTU (RS485)
+    - 통신 방식: Serial (TTL/RS485 변환기 사용)
+    - 보드레이트: 9600 (기본값)
+
+Modbus 레지스터 맵 (예시):
+    - 일사량: 0x0000 (W/m² 단위)
+
+사용법:
+    python -m src.collectors.solar_reader
+
+작성일: 2025-10-10
 """
 
-from typing import Dict, Optional, Tuple
 import time
 import logging
+import statistics
+from datetime import datetime, timezone
+from typing import List, Optional
 
-import minimalmodbus
-import serial
+try:
+    from pymodbus.client import ModbusSerialClient
+    from pymodbus.exceptions import ModbusException
+    MODBUS_AVAILABLE = True
+except ImportError:
+    MODBUS_AVAILABLE = False
+    logging.warning("⚠️  pymodbus not installed. Install with: pip install pymodbus")
+
+from src.db.client import get_cursor
+from src.config.settings import settings
 
 log = logging.getLogger("solar_reader")
 
-# 기본 레지스터 맵 (매뉴얼 기준)
-# (register_address, decimals_for_minimalmodbus, signed_flag, scale, offset)
-# - irradiance: reg 0x0000, 16-bit unsigned, scale 1.0 (단위 W/m^2)
-# - calibration: reg 0x0052, 16-bit unsigned, scale 1.0 (설정 쓰기용)
-DEFAULT_REGISTER_MAP = {
-    "irradiance": (0x0000, 0, False, 1.0, 0.0),
-    "calibration": (0x0052, 0, False, 1.0, 0.0),
-}
+# ========================================
+# 전역 변수
+# ========================================
+SOLAR_DEVICE = settings.SOLAR_ID  # 31
+COLLECTION_INTERVAL = settings.COLLECTION_INTERVAL  # 5초
 
-# 기본 통신/재시도 설정 (매뉴얼 기본 baud 4800)
-DEFAULT_TIMEOUT = 1.0   # seconds
-DEFAULT_RETRIES = 2
-DEFAULT_BAUDRATE = 9600
-DEFAULT_MODE = minimalmodbus.MODE_RTU
+# 메모리 버퍼: 5초 데이터를 1분간 누적
+data_buffer: List[dict] = []
+
+# Modbus 클라이언트 (전역)
+modbus_client: Optional[ModbusSerialClient] = None
 
 
-def create_instrument(
-    port: str = "COM8",
-    slave_id: int = 1,
-    baudrate: int = DEFAULT_BAUDRATE,
-    bytesize: int = 8,
-    parity: str = serial.PARITY_NONE,
-    stopbits: int = 1,
-    timeout: float = DEFAULT_TIMEOUT,
-    mode: str = DEFAULT_MODE,
-    clear_buffers_before_each_transaction: bool = True,
-) -> minimalmodbus.Instrument:
+# ========================================
+# Modbus 클라이언트 초기화
+# ========================================
+def init_modbus_client() -> Optional[ModbusSerialClient]:
     """
-    minimalmodbus.Instrument 생성기.
-    - 기본값은 매뉴얼 권장값(baud=4800)으로 설정.
-    - 반환된 Instrument로 read_solar_sensor / write_calibration 호출.
+    Modbus RTU 시리얼 클라이언트 초기화
+    
+    Returns:
+        ModbusSerialClient: 초기화된 클라이언트 또는 None
+    
+    설정:
+        - port: settings.SOLAR_PORT (예: /dev/ttyUSB2)
+        - baudrate: settings.SOLAR_BAUDRATE (기본: 9600)
+        - timeout: settings.SOLAR_TIMEOUT (기본: 1.0초)
     """
-    inst = minimalmodbus.Instrument(port, slave_id)
-    inst.serial.baudrate = baudrate
-    inst.serial.bytesize = bytesize
-    inst.serial.parity = parity
-    inst.serial.stopbits = stopbits
-    inst.serial.timeout = timeout
-    inst.mode = mode
-    inst.clear_buffers_before_each_transaction = clear_buffers_before_each_transaction
-    return inst
-
-
-def _safe_read_register(
-    inst: minimalmodbus.Instrument,
-    register: int,
-    decimals: int,
-    signed: bool,
-    functioncode: int = 3,
-    retries: int = DEFAULT_RETRIES,
-    retry_delay: float = 0.05,
-) -> Optional[int]:
-    """
-    minimalmodbus read_register 래퍼(재시도 포함).
-    - register: Holding register 주소 (0 기반)
-    - decimals: 0 사용 권장 (raw int), signed: False (irradiance unsigned)
-    - 반환: raw int 또는 None (실패)
-    """
-    for attempt in range(retries + 1):
-        try:
-            raw = inst.read_register(register, decimals, functioncode=functioncode, signed=signed)
-            return int(raw)
-        except Exception as e:
-            log.debug("solar_reader: read_register failed reg=0x%04X unit=%s attempt=%s err=%s", register, inst.address, attempt, e)
-            time.sleep(retry_delay)
-    log.warning("solar_reader: failed to read register 0x%04X unit=%s after %s attempts", register, inst.address, retries + 1)
-    return None
-
-
-def read_solar_sensor(inst: minimalmodbus.Instrument, register_map: Dict[str, Tuple[int, int, bool, float, float]] = None) -> Dict[str, Optional[float]]:
-    """
-    센서에서 일사량을 읽어 반환.
-    - 반환: {"irradiance_w_m2": float|None}
-    - 만약 센서가 모듈 온도를 제공하면 추가 필드(module_temp_c)를 반환할 수 있음(기본 맵엔 없음).
-    """
-    if register_map is None:
-        register_map = DEFAULT_REGISTER_MAP
-
-    out: Dict[str, Optional[float]] = {"irradiance_w_m2": None}
-
-    # 읽기: irradiance (reg 0x0000)
-    if "irradiance" in register_map:
-        reg, decimals, signed, scale, offset = register_map["irradiance"]
-        raw = _safe_read_register(inst, reg, decimals, signed, functioncode=3)
-        if raw is not None:
-            try:
-                # manual: raw value is directly W/m^2 (resolution 1 W/m^2)
-                out["irradiance_w_m2"] = float(raw) * float(scale) + float(offset)
-            except Exception:
-                log.exception("solar_reader: conversion failed raw=%s scale=%s offset=%s", raw, scale, offset)
-                out["irradiance_w_m2"] = None
-
-    return out
-
-
-def write_calibration(inst: minimalmodbus.Instrument, cal_value: int) -> bool:
-    """
-    센서 보정값(레지스터 0x0052)에 쓰기.
-    - cal_value: 정수 W/m^2 (매뉴얼 예: 0x000A => 10 W/m^2)
-    - 사용 예: write_calibration(inst, 10)
-    - 반환: True(성공)/False(실패)
-    """
-    reg, decimals, signed, scale, offset = DEFAULT_REGISTER_MAP["calibration"]
+    if not MODBUS_AVAILABLE:
+        log.error("❌ pymodbus not available")
+        return None
+    
     try:
-        # minimalmodbus write_register uses functioncode 6 by default for single register writes
-        inst.write_register(reg, int(cal_value), number_of_decimals=0, functioncode=6)
-        log.info("solar_reader: wrote calibration %s to reg=0x%04X unit=%s", cal_value, reg, inst.address)
-        return True
+        client = ModbusSerialClient(
+            port=settings.SOLAR_PORT,
+            baudrate=settings.SOLAR_BAUDRATE,
+            timeout=settings.SOLAR_TIMEOUT,
+            bytesize=8,
+            parity='N',
+            stopbits=1
+        )
+        
+        if client.connect():
+            log.info(f"✅ Solar Modbus client connected: {settings.SOLAR_PORT}")
+            return client
+        else:
+            log.error(f"❌ Solar Modbus connection failed: {settings.SOLAR_PORT}")
+            return None
+            
     except Exception as e:
-        log.exception("solar_reader: write_calibration failed reg=0x%04X unit=%s val=%s err=%s", reg, inst.address, cal_value, e)
-        return False
+        log.exception(f"❌ Solar Modbus client initialization failed: {e}")
+        return None
 
 
-def update_register_map(new_map: Dict[str, Tuple[int, int, bool, float, float]]):
+# ========================================
+# Modbus 레지스터 읽기
+# ========================================
+def read_modbus_registers(
+    client: ModbusSerialClient,
+    address: int,
+    count: int
+) -> Optional[List[int]]:
     """
-    런타임에 DEFAULT_REGISTER_MAP 덮어쓰기(테스트/현장 조정용).
+    Modbus 홀딩 레지스터 읽기
+    
+    Args:
+        client: Modbus 클라이언트
+        address: 시작 레지스터 주소
+        count: 읽을 레지스터 개수
+    
+    Returns:
+        Optional[List[int]]: 레지스터 값 리스트 또는 None (실패 시)
     """
-    global DEFAULT_REGISTER_MAP
-    DEFAULT_REGISTER_MAP = new_map.copy()
-    log.info("solar_reader: DEFAULT_REGISTER_MAP updated: %s", DEFAULT_REGISTER_MAP)
+    try:
+        response = client.read_holding_registers(
+            address=address,
+            count=count,
+            slave=SOLAR_DEVICE
+        )
+        
+        if response.isError():
+            log.error(f"❌ Modbus read error: device={SOLAR_DEVICE}, addr={address}")
+            return None
+        
+        return response.registers
+        
+    except ModbusException as e:
+        log.error(f"❌ Modbus exception: device={SOLAR_DEVICE}, {e}")
+        return None
+    except Exception as e:
+        log.error(f"❌ Unexpected error: device={SOLAR_DEVICE}, {e}")
+        return None
+
+
+# ========================================
+# 일사량 센서 데이터 읽기
+# ========================================
+def read_solar_sensor_data(client: ModbusSerialClient) -> Optional[dict]:
+    """
+    일사량 센서에서 데이터 읽기
+    
+    Args:
+        client: Modbus 클라이언트
+    
+    Returns:
+        Optional[dict]: 일사량 데이터 또는 None (실패 시)
+            {
+                'device_id': int,
+                'timestamp': datetime,
+                'irradiance_w_per_m2': float  # 일사량 (W/m²)
+            }
+    
+    레지스터 맵 (예시 - 실제 센서 매뉴얼 참고):
+        0x0000: 일사량 (W/m² 단위, 또는 0.1 W/m² 단위)
+    
+    주의:
+        - 레지스터 주소는 센서 모델마다 다를 수 있음
+        - 스케일 팩터는 매뉴얼 참고
+        - 일부 센서는 16-bit, 일부는 32-bit 사용
+    """
+    try:
+        # ========================================
+        # 1. 일사량 레지스터 읽기
+        # ========================================
+        # 예시 1: 16-bit 단일 레지스터 (0.1 W/m² 단위)
+        regs = read_modbus_registers(client, 0x0000, 1)
+        if not regs:
+            return None
+        
+        irradiance = regs[0] / 10.0  # 스케일 팩터: 10
+        
+        # 예시 2: 32-bit 두 레지스터 (1 W/m² 단위)
+        # regs = read_modbus_registers(client, 0x0000, 2)
+        # if not regs:
+        #     return None
+        # irradiance = (regs[0] << 16) | regs[1]  # 32-bit 결합
+        
+        # ========================================
+        # 2. 범위 검증 (0 ~ 2000 W/m²)
+        # ========================================
+        if irradiance < 0 or irradiance > 2000:
+            log.warning(f"⚠️  Invalid irradiance value: {irradiance} W/m²")
+            irradiance = max(0, min(2000, irradiance))  # 클리핑
+        
+        # ========================================
+        # 3. 결과 데이터 구성
+        # ========================================
+        data = {
+            'device_id': SOLAR_DEVICE,
+            'timestamp': datetime.now(timezone.utc),
+            'irradiance_w_per_m2': round(irradiance, 1)
+        }
+        
+        return data
+        
+    except Exception as e:
+        log.error(f"❌ Failed to read solar sensor: {e}")
+        return None
+
+
+# ========================================
+# 5초 데이터 수집 (메모리 버퍼)
+# ========================================
+def collect_5s_data(client: ModbusSerialClient):
+    """
+    Solar 디바이스의 5초 데이터를 읽어 메모리 버퍼에 저장
+    
+    Args:
+        client: Modbus 클라이언트
+    
+    동작:
+        1. 일사량 데이터 읽기
+        2. 메모리 버퍼에 추가 (DB 저장 안함)
+        3. 실시간 API에서 이 버퍼를 읽어서 제공
+    """
+    data = read_solar_sensor_data(client)
+    
+    if data:
+        data_buffer.append(data)
+        
+        log.debug(
+            f"📥 Solar: "
+            f"일사량={data['irradiance_w_per_m2']:.1f}W/m²"
+        )
+    else:
+        log.warning(f"⚠️  Solar: 데이터 읽기 실패")
+
+
+# ========================================
+# 1분마다 평균 계산 및 DB 저장
+# ========================================
+def flush_1m_aggregation():
+    """
+    1분마다 버퍼의 5초 데이터를 평균 계산하여 1분 테이블에 저장
+    
+    동작:
+        dummy_solar_collector.py의 flush_1m_aggregation()과 동일
+        실제 장치에서 읽은 데이터를 집계하여 DB에 저장
+    """
+    global data_buffer
+    
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    
+    log.info(f"\n⏰ 1분 집계 시작: {now.isoformat()}")
+    
+    try:
+        if not data_buffer:
+            log.warning(f"  ⚠️  Solar: 버퍼 데이터 없음")
+            return
+        
+        # 집계 계산
+        irradiances = [r['irradiance_w_per_m2'] for r in data_buffer]
+        
+        avg_irradiance = statistics.mean(irradiances)
+        max_irradiance = max(irradiances)
+        min_irradiance = min(irradiances)
+        
+        count = len(data_buffer)
+        
+        # DB INSERT
+        with get_cursor() as cur:
+            cur.execute(f"""
+                INSERT INTO solar_data_{SOLAR_DEVICE}_1m (
+                    time_bucket,
+                    avg_irradiance_w_per_m2,
+                    max_irradiance_w_per_m2,
+                    min_irradiance_w_per_m2,
+                    count
+                ) VALUES (
+                    %s, %s, %s, %s, %s
+                )
+                ON CONFLICT (time_bucket) DO UPDATE SET
+                    avg_irradiance_w_per_m2 = EXCLUDED.avg_irradiance_w_per_m2,
+                    max_irradiance_w_per_m2 = EXCLUDED.max_irradiance_w_per_m2,
+                    min_irradiance_w_per_m2 = EXCLUDED.min_irradiance_w_per_m2,
+                    count = EXCLUDED.count;
+            """, (
+                now, avg_irradiance, max_irradiance, min_irradiance, count
+            ))
+        
+        log.info(
+            f"  ✅ Solar 1분 집계 저장: "
+            f"평균={avg_irradiance:.1f}W/m²({min_irradiance:.1f}-{max_irradiance:.1f}), "
+            f"samples={count}"
+        )
+        
+    except Exception as e:
+        log.error(f"  ❌ Solar 1분 집계 실패: {e}")
+    
+    # 버퍼 클리어
+    data_buffer.clear()
+    log.info("🧹 버퍼 클리어 완료\n")
+
+
+# ========================================
+# 메인 실행 루프
+# ========================================
+def run():
+    """
+    Solar Reader 메인 루프
+    
+    동작:
+        1. Modbus 클라이언트 초기화
+        2. 5초마다 데이터 수집 (메모리 버퍼)
+        3. 1분마다 집계 및 DB 저장
+        4. Ctrl+C로 종료 시 정상 종료
+    """
+    global modbus_client
+    
+    log.info("=" * 60)
+    log.info("🔌 Solar Reader 시작")
+    log.info(f"   Port: {settings.SOLAR_PORT}")
+    log.info(f"   Baudrate: {settings.SOLAR_BAUDRATE}")
+    log.info(f"   Device: {SOLAR_DEVICE}")
+    log.info("=" * 60)
+    
+    # Modbus 클라이언트 초기화
+    modbus_client = init_modbus_client()
+    if not modbus_client:
+        log.error("❌ Modbus 클라이언트 초기화 실패. 종료합니다.")
+        return
+    
+    # 마지막 집계 시각
+    last_flush_minute = datetime.now(timezone.utc).minute
+    
+    try:
+        while True:
+            # 5초 데이터 수집
+            collect_5s_data(modbus_client)
+            
+            # 1분 경과 확인
+            current_minute = datetime.now(timezone.utc).minute
+            if current_minute != last_flush_minute:
+                flush_1m_aggregation()
+                last_flush_minute = current_minute
+            
+            # 5초 대기
+            time.sleep(COLLECTION_INTERVAL)
+            
+    except KeyboardInterrupt:
+        log.info("\n🛑 Solar Reader 종료 (사용자 요청)")
+    except Exception as e:
+        log.exception(f"❌ Solar Reader 오류: {e}")
+    finally:
+        if modbus_client:
+            modbus_client.close()
+            log.info("🔌 Modbus 연결 종료")
+
+
+if __name__ == "__main__":
+    """
+    직접 실행 시 Solar 리더 시작
+    
+    사용법:
+        python -m src.collectors.solar_reader
+    
+    요구사항:
+        pip install pymodbus
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    run()

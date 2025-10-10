@@ -24,7 +24,7 @@ def query_solar_window(
     preset: Optional[str] = None,
     start: Optional[str] = None,
     end: Optional[str] = None,
-    max_points: int = 1000,
+    max_points: int = 1,
     device_id: Optional[int] = None
 ) -> Dict[str, Any]:
     """

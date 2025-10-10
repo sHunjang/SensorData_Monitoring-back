@@ -1,209 +1,503 @@
-# src/sensors/modbus_reader.py
 """
-TAC4300 Modbus reader (minimalmodbus 기반, FC=03)
-- REGISTER_MAP 정의에 따라 레지스터를 읽고 스케일 적용하여 값을 반환.
-- High-word -> Low-word 정렬로 32bit 값을 조립.
-- read_summary()는 실패 항목을 None으로 설정하여 호출 쪽에서 방어적으로 처리 가능.
-- 변경점 요약:
-  * ModbusInstrument에 __getattr__과 serial 프로퍼티 추가.
-    -> collector가 inst.instrument 또는 inst.serial에 접근하려는 상황을 안전하게 지원.
-  * read/register 읽기 로직은 wrapper의 메서드 호출을 사용하도록 정리.
+Modbus 장치 통신 모듈
+
+이 모듈은 실제 Modbus RTU 프로토콜을 통해 전력계와 통신하여
+전력 데이터를 읽어옵니다.
+
+주요 기능:
+    1. Modbus RTU 시리얼 통신
+    2. 3상 4선/3선 전력계 데이터 읽기
+    3. 5초 주기 데이터 수집
+    4. 메모리 버퍼 관리
+    5. 1분마다 자동 집계 및 DB 저장
+
+하드웨어 구성:
+    - 전력계: Modbus RTU (RS485)
+    - 통신 방식: Serial (TTL/RS485 변환기 사용)
+    - 보드레이트: 9600 (기본값)
+    - 데이터 비트: 8
+    - 패리티: None
+    - 스톱 비트: 1
+
+Modbus 레지스터 맵:
+    - 전압: 0x0000-0x0003
+    - 전류: 0x0008-0x000B
+    - 전력: 0x0012-0x0015
+    - 역률: 0x001E
+    - 전력량: 0x0100-0x0103
+
+사용법:
+    python -m src.collectors.modbus_reader
+
+작성일: 2025-10-10
 """
 
-import logging
 import time
-import serial
-from typing import Dict, Any, Optional
-import minimalmodbus
+import logging
+import statistics
+from datetime import datetime, timezone
+from collections import defaultdict
+from typing import Dict, List, Optional
+
+try:
+    from pymodbus.client import ModbusSerialClient
+    from pymodbus.exceptions import ModbusException
+    MODBUS_AVAILABLE = True
+except ImportError:
+    MODBUS_AVAILABLE = False
+    logging.warning("⚠️  pymodbus not installed. Install with: pip install pymodbus")
+
+from src.db.client import get_cursor
+from src.config.settings import settings
 
 log = logging.getLogger("modbus_reader")
 
-# -----------------------
-# REGISTER_MAP (매뉴얼 기반)
-# key: (start_address, word_count, signed_flag, scale)
-# -----------------------
-REGISTER_MAP = {
-    "l1_voltage_v":                (0x0000, 2, False, 0.01),
-    "l2_voltage_v":                (0x0002, 2, False, 0.01),
-    "l3_voltage_v":                (0x0004, 2, False, 0.01),
+# ========================================
+# 전역 변수
+# ========================================
+MODBUS_DEVICES = settings.MODBUS_3W_IDS
+COLLECTION_INTERVAL = settings.COLLECTION_INTERVAL  # 5초
 
-    "l1_current_a":                (0x0006, 2, False, 0.001),
-    "l2_current_a":                (0x0008, 2, False, 0.001),
-    "l3_current_a":                (0x000A, 2, False, 0.001),
+# 메모리 버퍼: device_id별로 5초 데이터를 1분간 누적
+data_buffer: Dict[int, List[dict]] = defaultdict(list)
 
-    "l1_active_power_kw":          (0x000C, 2, True, 0.001),
-    "l2_active_power_kw":          (0x000E, 2, True, 0.001),
-    "l3_active_power_kw":          (0x0010, 2, True, 0.001),
-
-    "l1_total_energy_kwh":         (0x0420, 2, False, 0.01),
-    "l2_total_energy_kwh":         (0x0422, 2, False, 0.01),
-    "l3_total_energy_kwh":         (0x0424, 2, False, 0.01),
-
-    "avg_line_to_line_volts_v":    (0x0038, 2, False, 0.01),
-    "avg_line_to_neutral_volts_v": (0x0036, 2, False, 0.01),
-    "sum_line_currents_a":         (0x0034, 2, False, 0.001),
-
-    "total_active_power_kw":       (0x002C, 2, True, 0.001),
-    "total_reactive_power_kvar":   (0x002E, 2, True, 0.001),
-    "total_apparent_power_kva":    (0x0030, 2, False, 0.001),
-
-    "total_power_factor":          (0x0032, 1, True, 0.001),
-
-    "total_active_energy_kwh":     (0x0404, 2, True, 0.01),
-    "total_reactive_energy_kvarh": (0x040C, 2, True, 0.01),
-    "total_apparent_energy_kvah":  (0x0410, 2, False, 0.01),
-}
-
-# -----------------------
-# 내부 유틸
-# -----------------------
-DEFAULT_TIMEOUT = 5
-DEFAULT_RETRIES = 5
+# Modbus 클라이언트 (전역)
+modbus_client: Optional[ModbusSerialClient] = None
 
 
-class ModbusInstrument:
+# ========================================
+# Modbus 클라이언트 초기화
+# ========================================
+def init_modbus_client() -> Optional[ModbusSerialClient]:
     """
-    minimalmodbus.Instrument을 래핑.
-    - wrapper는 호출자(collector)에서 inst.serial이나 inst.read_registers 호출을 기대할 때
-      원활히 동작하도록 __getattr__으로 위임한다.
-    - close() 메서드로 serial 포트 닫기 지원.
+    Modbus RTU 시리얼 클라이언트 초기화
+    
+    Returns:
+        ModbusSerialClient: 초기화된 클라이언트 또는 None
+    
+    설정:
+        - port: settings.MODBUS_PORT (예: /dev/ttyUSB0)
+        - baudrate: settings.MODBUS_BAUDRATE (기본: 9600)
+        - timeout: settings.MODBUS_TIMEOUT (기본: 1.0초)
+        - bytesize: 8
+        - parity: N (None)
+        - stopbits: 1
+    
+    예외 처리:
+        연결 실패 시 None 반환 및 로그 기록
     """
-    def __init__(self, instrument: minimalmodbus.Instrument):
-        self.instrument = instrument
+    if not MODBUS_AVAILABLE:
+        log.error("❌ pymodbus not available")
+        return None
+    
+    try:
+        client = ModbusSerialClient(
+            port=settings.MODBUS_PORT,
+            baudrate=settings.MODBUS_BAUDRATE,
+            timeout=settings.MODBUS_TIMEOUT,
+            bytesize=8,
+            parity='N',
+            stopbits=1
+        )
+        
+        if client.connect():
+            log.info(f"✅ Modbus client connected: {settings.MODBUS_PORT}")
+            return client
+        else:
+            log.error(f"❌ Modbus connection failed: {settings.MODBUS_PORT}")
+            return None
+            
+    except Exception as e:
+        log.exception(f"❌ Modbus client initialization failed: {e}")
+        return None
 
-    def close(self):
-        """내부 시리얼 포트 닫기 시도 (안전하게 처리)"""
-        try:
-            ser = getattr(self.instrument, "serial", None)
-            if ser and getattr(ser, "is_open", False):
-                ser.close()
-        except Exception as e:
-            log.debug("Failed to close instrument: %s", e)
 
-    def __getattr__(self, name):
-        """
-        래퍼가 갖고 있지 않은 속성/메서드는 내부 instrument로 위임.
-        예: inst.read_registers(...) 또는 inst.serial 접근이 가능해짐.
-        """
-        return getattr(self.instrument, name)
-
-    @property
-    def serial(self):
-        """직접 serial 접근을 허용 (collector에서 ser = inst.serial 사용 가능)"""
-        return getattr(self.instrument, "serial", None)
-
-
-def create_instrument(
-    port: str,
-    slave_id: int,
-    baudrate: int = 9600,
-    parity: str = "N",
-    stopbits: int = 1,
-    bytesize: int = 8,
-    timeout: int = DEFAULT_TIMEOUT,
-) -> ModbusInstrument:
+# ========================================
+# Modbus 레지스터 읽기
+# ========================================
+def read_modbus_registers(
+    client: ModbusSerialClient,
+    device_id: int,
+    address: int,
+    count: int
+) -> Optional[List[int]]:
     """
-    minimalmodbus.Instrument 생성 및 초기 설정 후 ModbusInstrument 래퍼로 반환.
-    - close_port_after_each_call=False로 설정해 성능 향상.
-    - 예외는 호출자에게 전달.
+    Modbus 홀딩 레지스터 읽기
+    
+    Args:
+        client: Modbus 클라이언트
+        device_id: 슬레이브 디바이스 ID (11-15)
+        address: 시작 레지스터 주소
+        count: 읽을 레지스터 개수
+    
+    Returns:
+        Optional[List[int]]: 레지스터 값 리스트 또는 None (실패 시)
+    
+    예외 처리:
+        - 통신 오류: None 반환 및 로그 기록
+        - 타임아웃: None 반환
     """
     try:
-        inst = minimalmodbus.Instrument(port, slave_id)
-        inst.serial.baudrate = baudrate
-        inst.serial.bytesize = bytesize
-
-        if parity.upper() == "N":
-            inst.serial.parity = serial.PARITY_NONE
-        elif parity.upper() == "E":
-            inst.serial.parity = serial.PARITY_EVEN
-        elif parity.upper() == "O":
-            inst.serial.parity = serial.PARITY_ODD
-
-        inst.serial.stopbits = stopbits
-        inst.serial.timeout = timeout
-
-        inst.clear_buffers_before_each_transaction = True
-        inst.close_port_after_each_call = False
-        inst.debug = False
-
-        log.debug("Created instrument port=%s slave_id=%s", port, slave_id)
-        return ModbusInstrument(inst)
-
+        response = client.read_holding_registers(
+            address=address,
+            count=count,
+            slave=device_id
+        )
+        
+        if response.isError():
+            log.error(f"❌ Modbus read error: device={device_id}, addr={address}")
+            return None
+        
+        return response.registers
+        
+    except ModbusException as e:
+        log.error(f"❌ Modbus exception: device={device_id}, {e}")
+        return None
     except Exception as e:
-        raise ConnectionError(f"Failed to create instrument {port}:{slave_id} - {e}")
+        log.error(f"❌ Unexpected error: device={device_id}, {e}")
+        return None
 
 
-def _read_registers_with_retry(inst: ModbusInstrument, addr: int, count: int, retries: int = DEFAULT_RETRIES):
+# ========================================
+# 전력계 데이터 읽기
+# ========================================
+def read_power_meter_data(client: ModbusSerialClient, device_id: int) -> Optional[dict]:
     """
-    read_registers 호출을 재시도하며 수행.
-    - 실패 시 마지막 예외를 포함한 Exception을 던짐.
+    전력계에서 전력 데이터 읽기
+    
+    Args:
+        client: Modbus 클라이언트
+        device_id: 디바이스 ID (11-15)
+    
+    Returns:
+        Optional[dict]: 전력 데이터 또는 None (실패 시)
+            {
+                'device_id': int,
+                'timestamp': datetime,
+                'avg_line_to_line_volts_v': float,
+                'avg_line_to_neutral_volts_v': float,  # 3상 4선만
+                'sum_line_currents_a': float,
+                'total_active_power_kw': float,
+                'total_reactive_power_kvar': float,
+                'total_apparent_power_kva': float,
+                'total_power_factor': float,
+                'total_active_energy_kwh': float,
+            }
+    
+    레지스터 맵 (예시 - 실제 전력계 매뉴얼 참고):
+        0x0000: 선간 전압 평균 (V × 10)
+        0x0001: 상전압 평균 (V × 10) - 3상 4선만
+        0x0008: 총 전류 (A × 100)
+        0x0012: 유효 전력 (kW × 100)
+        0x0013: 무효 전력 (kvar × 100)
+        0x0014: 피상 전력 (kVA × 100)
+        0x001E: 역률 (× 1000)
+        0x0100: 누적 전력량 상위 (kWh)
+        0x0101: 누적 전력량 하위 (kWh)
+    
+    주의:
+        - 레지스터 주소는 전력계 모델마다 다를 수 있음
+        - 스케일 팩터는 매뉴얼 참고
     """
-    last_error = None
-    for attempt in range(retries + 1):
+    try:
+        # ========================================
+        # 1. 전압 읽기 (선간 전압)
+        # ========================================
+        voltage_regs = read_modbus_registers(client, device_id, 0x0000, 1)
+        if not voltage_regs:
+            return None
+        line_to_line_v = voltage_regs[0] / 10.0  # 스케일 팩터: 10
+        
+        # ========================================
+        # 2. 상전압 읽기 (3상 4선만)
+        # ========================================
+        line_to_neutral_v = None
+        if device_id in settings.THREE_PHASE_FOUR_WIRE_IDS:
+            neutral_regs = read_modbus_registers(client, device_id, 0x0001, 1)
+            if neutral_regs:
+                line_to_neutral_v = neutral_regs[0] / 10.0
+        
+        # ========================================
+        # 3. 전류 읽기
+        # ========================================
+        current_regs = read_modbus_registers(client, device_id, 0x0008, 1)
+        if not current_regs:
+            return None
+        current_a = current_regs[0] / 100.0  # 스케일 팩터: 100
+        
+        # ========================================
+        # 4. 전력 읽기 (유효, 무효, 피상)
+        # ========================================
+        power_regs = read_modbus_registers(client, device_id, 0x0012, 3)
+        if not power_regs:
+            return None
+        active_kw = power_regs[0] / 100.0
+        reactive_kvar = power_regs[1] / 100.0
+        apparent_kva = power_regs[2] / 100.0
+        
+        # ========================================
+        # 5. 역률 읽기
+        # ========================================
+        pf_regs = read_modbus_registers(client, device_id, 0x001E, 1)
+        if not pf_regs:
+            return None
+        power_factor = pf_regs[0] / 1000.0  # 스케일 팩터: 1000
+        
+        # ========================================
+        # 6. 누적 전력량 읽기 (32비트: 상위+하위)
+        # ========================================
+        energy_regs = read_modbus_registers(client, device_id, 0x0100, 2)
+        if not energy_regs:
+            return None
+        # 32비트 결합: (상위 << 16) | 하위
+        energy_kwh = ((energy_regs[0] << 16) | energy_regs[1]) / 100.0
+        
+        # ========================================
+        # 7. 결과 데이터 구성
+        # ========================================
+        data = {
+            'device_id': device_id,
+            'timestamp': datetime.now(timezone.utc),
+            'avg_line_to_line_volts_v': round(line_to_line_v, 2),
+            'sum_line_currents_a': round(current_a, 2),
+            'total_active_power_kw': round(active_kw, 2),
+            'total_reactive_power_kvar': round(reactive_kvar, 2),
+            'total_apparent_power_kva': round(apparent_kva, 2),
+            'total_power_factor': round(power_factor, 3),
+            'total_active_energy_kwh': round(energy_kwh, 2),
+        }
+        
+        # 3상 4선인 경우 상전압 추가
+        if line_to_neutral_v is not None:
+            data['avg_line_to_neutral_volts_v'] = round(line_to_neutral_v, 2)
+        
+        return data
+        
+    except Exception as e:
+        log.error(f"❌ Failed to read power meter {device_id}: {e}")
+        return None
+
+
+# ========================================
+# 5초 데이터 수집 (메모리 버퍼)
+# ========================================
+def collect_5s_data(client: ModbusSerialClient):
+    """
+    모든 Modbus 디바이스의 5초 데이터를 읽어 메모리 버퍼에 저장
+    
+    Args:
+        client: Modbus 클라이언트
+    
+    동작:
+        1. 각 device_id에 대해 전력계 데이터 읽기
+        2. 메모리 버퍼에 추가 (DB 저장 안함)
+        3. 실시간 API에서 이 버퍼를 읽어서 제공
+    """
+    for device_id in MODBUS_DEVICES:
+        data = read_power_meter_data(client, device_id)
+        
+        if data:
+            # 메모리 버퍼에 추가
+            data_buffer[device_id].append(data)
+            
+            log.debug(
+                f"📥 Device {device_id}: "
+                f"{data['total_active_power_kw']:.2f}kW, "
+                f"{data['sum_line_currents_a']:.2f}A"
+            )
+        else:
+            log.warning(f"⚠️  Device {device_id}: 데이터 읽기 실패")
+
+
+# ========================================
+# 1분마다 평균 계산 및 DB 저장
+# ========================================
+def flush_1m_aggregation():
+    """
+    1분마다 버퍼의 5초 데이터를 평균 계산하여 1분 테이블에 저장
+    
+    동작:
+        dummy_modbus_collector.py의 flush_1m_aggregation()과 동일
+        실제 장치에서 읽은 데이터를 집계하여 DB에 저장
+    """
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    
+    log.info(f"\n⏰ 1분 집계 시작: {now.isoformat()}")
+    
+    for device_id in MODBUS_DEVICES:
         try:
-            # wrapper의 __getattr__ 덕분에 inst.read_registers 호출 가능
-            result = inst.read_registers(addr, count, functioncode=3)
-            if result is not None:
-                return result
+            rows = data_buffer[device_id]
+            
+            if not rows:
+                log.warning(f"  ⚠️  Device {device_id}: 버퍼 데이터 없음")
+                continue
+            
+            # 집계 계산
+            avg_voltage = statistics.mean(r['avg_line_to_line_volts_v'] for r in rows)
+            avg_current = statistics.mean(r['sum_line_currents_a'] for r in rows)
+            avg_kw = statistics.mean(r['total_active_power_kw'] for r in rows)
+            max_kw = max(r['total_active_power_kw'] for r in rows)
+            min_kw = min(r['total_active_power_kw'] for r in rows)
+            avg_pf = statistics.mean(r['total_power_factor'] for r in rows)
+            avg_kvar = statistics.mean(r['total_reactive_power_kvar'] for r in rows)
+            avg_kva = statistics.mean(r['total_apparent_power_kva'] for r in rows)
+            total_kwh = rows[-1]['total_active_energy_kwh'] - rows[0]['total_active_energy_kwh']
+            count = len(rows)
+            
+            # DB INSERT (3상 4선/3선 구분)
+            if device_id in settings.THREE_PHASE_FOUR_WIRE_IDS:
+                avg_voltage_n = statistics.mean(
+                    r['avg_line_to_neutral_volts_v'] for r in rows
+                )
+                
+                with get_cursor() as cur:
+                    cur.execute(f"""
+                        INSERT INTO modbus_data_{device_id}_1m (
+                            time_bucket,
+                            avg_line_to_line_volts_v,
+                            avg_line_to_neutral_volts_v,
+                            sum_line_currents_a,
+                            avg_active_power_kw,
+                            max_active_power_kw,
+                            min_active_power_kw,
+                            avg_reactive_power_kvar,
+                            avg_apparent_power_kva,
+                            avg_power_factor,
+                            total_active_energy_kwh,
+                            count
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        )
+                        ON CONFLICT (time_bucket) DO UPDATE SET
+                            avg_line_to_line_volts_v = EXCLUDED.avg_line_to_line_volts_v,
+                            avg_line_to_neutral_volts_v = EXCLUDED.avg_line_to_neutral_volts_v,
+                            sum_line_currents_a = EXCLUDED.sum_line_currents_a,
+                            avg_active_power_kw = EXCLUDED.avg_active_power_kw,
+                            max_active_power_kw = EXCLUDED.max_active_power_kw,
+                            min_active_power_kw = EXCLUDED.min_active_power_kw,
+                            avg_power_factor = EXCLUDED.avg_power_factor,
+                            count = EXCLUDED.count;
+                    """, (
+                        now, avg_voltage, avg_voltage_n, avg_current,
+                        avg_kw, max_kw, min_kw, avg_kvar, avg_kva,
+                        avg_pf, total_kwh, count
+                    ))
+            
+            elif device_id in settings.THREE_PHASE_THREE_WIRE_IDS:
+                with get_cursor() as cur:
+                    cur.execute(f"""
+                        INSERT INTO modbus_data_{device_id}_1m (
+                            time_bucket,
+                            avg_line_to_line_volts_v,
+                            sum_line_currents_a,
+                            avg_active_power_kw,
+                            max_active_power_kw,
+                            min_active_power_kw,
+                            avg_reactive_power_kvar,
+                            avg_apparent_power_kva,
+                            avg_power_factor,
+                            total_active_energy_kwh,
+                            count
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        )
+                        ON CONFLICT (time_bucket) DO UPDATE SET
+                            avg_line_to_line_volts_v = EXCLUDED.avg_line_to_line_volts_v,
+                            sum_line_currents_a = EXCLUDED.sum_line_currents_a,
+                            avg_active_power_kw = EXCLUDED.avg_active_power_kw,
+                            max_active_power_kw = EXCLUDED.max_active_power_kw,
+                            min_active_power_kw = EXCLUDED.min_active_power_kw,
+                            avg_power_factor = EXCLUDED.avg_power_factor,
+                            count = EXCLUDED.count;
+                    """, (
+                        now, avg_voltage, avg_current,
+                        avg_kw, max_kw, min_kw, avg_kvar, avg_kva,
+                        avg_pf, total_kwh, count
+                    ))
+            
+            log.info(
+                f"  ✅ Device {device_id} 1분 집계 저장: "
+                f"avg={avg_kw:.2f}kW, max={max_kw:.2f}kW, samples={count}"
+            )
+            
         except Exception as e:
-            last_error = e
-            log.debug("read_registers failed addr=0x%04X count=%d attempt=%d err=%s", addr, count, attempt + 1, e)
-            if attempt < retries:
-                time.sleep(0.05)
-    raise Exception(f"failed read_registers addr=0x{addr:04X} count={count} after {retries + 1} attempts: {last_error}")
+            log.error(f"  ❌ Device {device_id} 1분 집계 실패: {e}")
+    
+    # 버퍼 클리어
+    data_buffer.clear()
+    log.info("🧹 버퍼 클리어 완료\n")
 
 
-def _words_to_uint32(high_word: int, low_word: int) -> int:
-    return ((high_word & 0xFFFF) << 16) | (low_word & 0xFFFF)
-
-
-def _words_to_int32(high_word: int, low_word: int) -> int:
-    raw = _words_to_uint32(high_word, low_word)
-    if raw & 0x80000000:
-        return raw - (1 << 32)
-    return raw
-
-
-def _read_32bit(inst: ModbusInstrument, addr: int, signed: bool):
-    """2워드(32bit) 읽기 및 signed/unsigned 반환"""
-    regs = _read_registers_with_retry(inst, addr, 2)
-    if not regs or len(regs) < 2:
-        raise ValueError(f"Invalid register data: {regs}")
-    hi, lo = regs[0], regs[1]
-    return _words_to_int32(hi, lo) if signed else _words_to_uint32(hi, lo)
-
-
-def read_summary(inst: ModbusInstrument) -> Dict[str, Optional[float]]:
+# ========================================
+# 메인 실행 루프
+# ========================================
+def run():
     """
-    REGISTER_MAP 전체를 순회하여 값을 읽고 스케일 적용 후 dict로 반환.
-    실패한 키는 None으로 채움.
-    반환 예:
-      {"total_active_power_kw": 1.234, "total_active_energy_kwh": 12345.67, ...}
+    Modbus 리더 메인 루프
+    
+    동작:
+        1. Modbus 클라이언트 초기화
+        2. 5초마다 데이터 수집 (메모리 버퍼)
+        3. 1분마다 집계 및 DB 저장
+        4. Ctrl+C로 종료 시 정상 종료
     """
-    out: Dict[str, Optional[float]] = {}
+    global modbus_client
+    
+    log.info("=" * 60)
+    log.info("🔌 Modbus Reader 시작")
+    log.info(f"   Port: {settings.MODBUS_PORT}")
+    log.info(f"   Baudrate: {settings.MODBUS_BAUDRATE}")
+    log.info(f"   Devices: {MODBUS_DEVICES}")
+    log.info(f"   3상 4선: {settings.THREE_PHASE_FOUR_WIRE_IDS}")
+    log.info(f"   3상 3선: {settings.THREE_PHASE_THREE_WIRE_IDS}")
+    log.info("=" * 60)
+    
+    # Modbus 클라이언트 초기화
+    modbus_client = init_modbus_client()
+    if not modbus_client:
+        log.error("❌ Modbus 클라이언트 초기화 실패. 종료합니다.")
+        return
+    
+    # 마지막 집계 시각
+    last_flush_minute = datetime.now(timezone.utc).minute
+    
+    try:
+        while True:
+            # 5초 데이터 수집
+            collect_5s_data(modbus_client)
+            
+            # 1분 경과 확인
+            current_minute = datetime.now(timezone.utc).minute
+            if current_minute != last_flush_minute:
+                flush_1m_aggregation()
+                last_flush_minute = current_minute
+            
+            # 5초 대기
+            time.sleep(COLLECTION_INTERVAL)
+            
+    except KeyboardInterrupt:
+        log.info("\n🛑 Modbus Reader 종료 (사용자 요청)")
+    except Exception as e:
+        log.exception(f"❌ Modbus Reader 오류: {e}")
+    finally:
+        if modbus_client:
+            modbus_client.close()
+            log.info("🔌 Modbus 연결 종료")
 
-    for key, (addr, word_count, signed, scale) in REGISTER_MAP.items():
-        try:
-            if word_count == 2:
-                raw = _read_32bit(inst, addr, signed)
-            else:
-                regs = _read_registers_with_retry(inst, addr, 1)
-                if not regs:
-                    raw = None
-                else:
-                    raw = regs[0]
-                    if signed and raw is not None and (raw & 0x8000):
-                        raw = raw - (1 << 16)
-            out[key] = (raw * scale) if (raw is not None and scale is not None) else (raw if raw is not None else None)
-        except Exception as e:
-            log.warning("read_summary failed key=%s addr=0x%04X err=%s", key, addr, e)
-            out[key] = None
 
-    return out
-
-
-def update_register_map(new_map):
-    """런타임에 REGISTER_MAP을 덮어씀 (테스트/현장 조정)"""
-    global REGISTER_MAP
-    REGISTER_MAP = new_map.copy()
-    log.info("REGISTER_MAP updated: %s", list(REGISTER_MAP.keys()))
+if __name__ == "__main__":
+    """
+    직접 실행 시 Modbus 리더 시작
+    
+    사용법:
+        python -m src.collectors.modbus_reader
+    
+    요구사항:
+        pip install pymodbus
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    run()

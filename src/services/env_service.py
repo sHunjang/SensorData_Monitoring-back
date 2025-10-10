@@ -37,7 +37,7 @@ def query_env_window(
     preset: Optional[str] = None,
     start: Optional[str] = None,
     end: Optional[str] = None,
-    max_points: int = 1000,
+    max_points: int = 1,
 ) -> Dict[str, Any]:
     """
     Env 센서 데이터 조회 (집계 자동 선택)
