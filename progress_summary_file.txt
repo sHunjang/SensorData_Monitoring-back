@@ -1,4 +1,4 @@
-20255-10-14
+*** 2025-10-14 ***
 ===================================================
 실시간 IoT 모니터링을 위한 백엔드 아키텍처 리팩토링
 
@@ -29,4 +29,45 @@
 - modbus_router.py: 새 service 함수 연동
 - env_router.py: 새 service 함수 연동  
 - solar_router.py: 새 service 함수 연동
+===================================================
+
+*** 2025-10-15 ***
+✅ 완료된 파일 목록
+설정 및 DB
+
+settings.py - 3선/4선 구분, 5초 폴링 주기
+
+bootstrap.py - 타입별 집계 테이블 생성 + 마이그레이션
+
+데이터 수집
+
+dummy_modbus_collector.py - 에너지 누적, 타입별 전압
+
+dummy_env_collector.py - 온습도 시뮬레이션
+
+dummy_solar_collector.py - 시간대별 일사량
+
+데이터 집계
+
+aggregator.py - 1분/15분/1시간/1일 자동 집계 (신규)
+
+비즈니스 로직
+
+modbus_service.py - 타입별 집계 테이블 조회
+
+env_service.py - 집계 테이블 조회 + 쾌적도
+
+solar_service.py - 집계 테이블 조회 + 효율 추정
+
+API 엔드포인트
+
+modbus_router.py - 4개 엔드포인트
+
+env_router.py - 4개 엔드포인트
+
+solar_router.py - 5개 엔드포인트
+
+메인 애플리케이션
+
+main.py - 수집기 + 집계기 통합 실행
 ===================================================

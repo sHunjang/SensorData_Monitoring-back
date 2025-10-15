@@ -1,139 +1,243 @@
-# src/routes/modbus_router.py
+"""
+Modbus(전력량계) API 라우터
+
+엔드포인트:
+- GET /data/modbus/query: 시계열 데이터 조회
+- GET /data/modbus/realtime: 실시간 데이터 조회
+- GET /data/modbus/today-energy: 오늘 누적 에너지
+- GET /data/modbus/statistics: 통계 조회
+
+*** 주요 수정 사항 ***
+✅ Service 함수 활용: 직접 SQL 작성 대신 modbus_service 함수 호출
+
+✅ 엔드포인트 추가:
+
+/realtime: 실시간 데이터
+
+/today-energy: 오늘 누적 에너지
+
+/statistics: 통계 조회
+
+✅ 에러 처리 개선: 명확한 에러 메시지
+
+✅ 로깅 강화: 성공/실패 로그
+
+✅ 파라미터 검증: device_id 범위 체크
+
+다음은 env_router.py를 보여드리겠습니다.
+"""
+
 from fastapi import APIRouter, Query, HTTPException
-from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
-from src.db.client import get_cursor
 import logging
+
+from src.services import modbus_service
 
 router = APIRouter(prefix="/data/modbus", tags=["modbus"])
 logger = logging.getLogger(__name__)
 
-ALLOWED_PRESETS = {"10s", "1m", "15m", "1h", "1d", "1w", "1mo"}
 
 @router.get("/query")
 async def get_modbus_data(
-    deviceid: int = Query(..., description="Device ID (11-15)"),
-    preset: str = Query(..., description="Time preset: 10s, 1m, 15m, 1h, 1d, 1w, 1mo"),
-    maxpoints: int = Query(100, description="Maximum data points"),
+    deviceid: int = Query(..., description="Device ID (11-15)", alias="deviceid"),
+    preset: Optional[str] = Query(None, description="Time preset: 1day, 1week, 1month, 1year"),
     start: Optional[str] = Query(None, description="Start time (ISO format)"),
-    end: Optional[str] = Query(None, description="End time (ISO format)")
+    end: Optional[str] = Query(None, description="End time (ISO format)"),
+    maxpoints: int = Query(1440, description="Maximum data points", alias="maxpoints")
 ) -> Dict[str, Any]:
-    if preset not in ALLOWED_PRESETS:
-        raise HTTPException(status_code=400, detail=f"Invalid preset: {preset}")
-
+    """
+    Modbus 시계열 데이터 조회
+    
+    Parameters:
+        - deviceid: 디바이스 ID (11~15)
+        - preset: 시간 범위 프리셋 (1day, 1week, 1month, 1year)
+        - start: 시작 시각 (ISO 8601)
+        - end: 종료 시각 (ISO 8601)
+        - maxpoints: 최대 데이터 포인트 수
+        
+    Returns:
+        {
+            "device_id": int,
+            "wire_type": "4wire" | "3wire",
+            "resolution": "1min" | "15min" | "1hour" | "1day",
+            "start": ISO string,
+            "end": ISO string,
+            "data_points": int,
+            "data": [...]
+        }
+    """
     try:
-        if start and end:
-            start_time = datetime.fromisoformat(start.replace('Z', '+00:00'))
-            end_time = datetime.fromisoformat(end.replace('Z', '+00:00'))
-        else:
-            end_time = datetime.now(timezone.utc)
-            if preset == '10s':
-                start_time = end_time - timedelta(seconds=10)
-            elif preset == '1m':
-                start_time = end_time - timedelta(minutes=1)
-            elif preset == '15m':
-                start_time = end_time - timedelta(minutes=15)
-            elif preset == '1h':
-                start_time = end_time - timedelta(hours=1)
-            elif preset == '1d':
-                start_time = end_time - timedelta(days=1)
-            elif preset == '1w':
-                start_time = end_time - timedelta(days=7)
-            elif preset == '1mo':
-                start_time = end_time - timedelta(days=30)
-
-        with get_cursor() as cursor:
-            if preset in ['1w', '1mo']:
-                query = """
-                SELECT
-                    date_trunc('day', time_stamp) AS bucket,
-                    AVG(total_active_power_kw) AS totalactivepowerkw,
-                    AVG(total_reactive_power_kvar) AS totalreactivepowerkvar,
-                    AVG(total_apparent_power_kva) AS totalapparentpowerkva,
-                    AVG(avg_line_to_line_volts_v) AS avglinetolinevoltsv,
-                    AVG(avg_line_to_neutral_volts_v) AS avglinetoneutralvoltsv,
-                    AVG(sum_line_currents_a) AS sumlinecurrentsa,
-                    AVG(total_power_factor) AS totalpowerfactor,
-                    MAX(total_active_energy_kwh) - MIN(total_active_energy_kwh) AS totalactiveenergykwh
-                FROM modbus_data
-                WHERE device_id = %s AND time_stamp >= %s AND time_stamp <= %s
-                GROUP BY 1
-                ORDER BY 1 ASC
-                LIMIT %s
-                """
-            elif preset in ['15m', '1h']:
-                query = """
-                SELECT
-                    date_trunc('minute', time_stamp) AS bucket,
-                    AVG(total_active_power_kw) AS totalactivepowerkw,
-                    AVG(total_reactive_power_kvar) AS totalreactivepowerkvar,
-                    AVG(total_apparent_power_kva) AS totalapparentpowerkva,
-                    AVG(avg_line_to_line_volts_v) AS avglinetolinevoltsv,
-                    AVG(avg_line_to_neutral_volts_v) AS avglinetoneutralvoltsv,
-                    AVG(sum_line_currents_a) AS sumlinecurrentsa,
-                    AVG(total_power_factor) AS totalpowerfactor,
-                    MAX(total_active_energy_kwh) - MIN(total_active_energy_kwh) AS totalactiveenergykwh
-                FROM modbus_data
-                WHERE device_id = %s AND time_stamp >= %s AND time_stamp <= %s
-                GROUP BY 1
-                ORDER BY 1 ASC
-                LIMIT %s
-                """
-            elif preset == '10s':
-                # 10초 단위 버킷: epoch를 10초로 나눈 뒤 floor -> to_timestamp
-                query = """
-                SELECT
-                    to_timestamp(floor(EXTRACT(EPOCH FROM time_stamp) / 10) * 10) AT TIME ZONE 'UTC' AS bucket,
-                    AVG(total_active_power_kw) AS totalactivepowerkw,
-                    AVG(total_reactive_power_kvar) AS totalreactivepowerkvar,
-                    AVG(total_apparent_power_kva) AS totalapparentpowerkva,
-                    AVG(avg_line_to_line_volts_v) AS avglinetolinevoltsv,
-                    AVG(avg_line_to_neutral_volts_v) AS avglinetoneutralvoltsv,
-                    AVG(sum_line_currents_a) AS sumlinecurrentsa,
-                    AVG(total_power_factor) AS totalpowerfactor,
-                    MAX(total_active_energy_kwh) - MIN(total_active_energy_kwh) AS totalactiveenergykwh
-                FROM modbus_data
-                WHERE device_id = %s AND time_stamp >= %s AND time_stamp <= %s
-                GROUP BY 1
-                ORDER BY 1 ASC
-                LIMIT %s
-                """
-            else:  # '1d' 원본 레코드
-                query = """
-                SELECT
-                    time_stamp AS bucket,
-                    total_active_power_kw AS totalactivepowerkw,
-                    total_reactive_power_kvar AS totalreactivepowerkvar,
-                    total_apparent_power_kva AS totalapparentpowerkva,
-                    avg_line_to_line_volts_v AS avglinetolinevoltsv,
-                    avg_line_to_neutral_volts_v AS avglinetoneutralvoltsv,
-                    sum_line_currents_a AS sumlinecurrentsa,
-                    total_power_factor AS totalpowerfactor,
-                    total_active_energy_kwh AS totalactiveenergykwh
-                FROM modbus_data
-                WHERE device_id = %s AND time_stamp >= %s AND time_stamp <= %s
-                ORDER BY time_stamp ASC
-                LIMIT %s
-                """
-
-            cursor.execute(query, (deviceid, start_time, end_time, maxpoints))
-            rows = cursor.fetchall()
-            columns = [d[0] for d in cursor.description]
-
-            data = []
-            for row in rows:
-                rd = dict(zip(columns, row))
-                if rd.get('bucket'):
-                    try:
-                        rd['bucket'] = rd['bucket'].isoformat()
-                    except Exception:
-                        pass
-                data.append(rd)
-
-        logger.info(f"Modbus 조회: device={deviceid}, preset={preset}, count={len(data)}")
-        return {"data": data, "count": len(data), "preset": preset, "device_id": deviceid,
-                "time_range": {"start": start_time.isoformat(), "end": end_time.isoformat()}}
-
+        # 디바이스 ID 유효성 검사
+        if deviceid not in range(11, 16):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid device_id: {deviceid}. Must be 11-15"
+            )
+        
+        # 서비스 함수 호출
+        result = modbus_service.query_modbus_data(
+            device_id=deviceid,
+            preset=preset,
+            start=start,
+            end=end,
+            max_points=maxpoints
+        )
+        
+        logger.info(
+            f"Modbus 조회 성공: device={deviceid}, preset={preset}, "
+            f"resolution={result['resolution']}, points={result['data_points']}"
+        )
+        
+        return result
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Modbus 에러: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Modbus 조회 실패: device={deviceid}, error={str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.get("/realtime")
+async def get_modbus_realtime(
+    deviceid: int = Query(..., description="Device ID (11-15)", alias="deviceid")
+) -> Dict[str, Any]:
+    """
+    Modbus 실시간 데이터 조회 (최신 1건)
+    
+    Parameters:
+        - deviceid: 디바이스 ID (11~15)
+        
+    Returns:
+        {
+            "time_stamp": ISO string,
+            "device_id": int,
+            "voltage": float,
+            "current": float,
+            "power": float,
+            "energy": float
+        }
+    """
+    try:
+        if deviceid not in range(11, 16):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid device_id: {deviceid}. Must be 11-15"
+            )
+        
+        result = modbus_service.query_modbus_realtime(device_id=deviceid)
+        
+        if not result:
+            return {
+                "time_stamp": None,
+                "device_id": deviceid,
+                "voltage": None,
+                "current": None,
+                "power": None,
+                "energy": None,
+                "message": "No data available"
+            }
+        
+        logger.info(f"Modbus 실시간 조회 성공: device={deviceid}")
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Modbus 실시간 조회 실패: device={deviceid}, error={str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.get("/today-energy")
+async def get_today_energy(
+    deviceid: int = Query(..., description="Device ID (11-15)", alias="deviceid")
+) -> Dict[str, Any]:
+    """
+    오늘(KST 00:00~현재) 누적 에너지 소비량 조회
+    
+    Parameters:
+        - deviceid: 디바이스 ID (11~15)
+        
+    Returns:
+        {
+            "device_id": int,
+            "date": ISO string (today),
+            "energy_kwh": float,
+            "wire_type": "4wire" | "3wire"
+        }
+    """
+    try:
+        if deviceid not in range(11, 16):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid device_id: {deviceid}. Must be 11-15"
+            )
+        
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        
+        energy = modbus_service.get_today_energy_kwh(device_id=deviceid)
+        wire_type = "4wire" if modbus_service._is_4wire(deviceid) else "3wire"
+        today = datetime.now(ZoneInfo("Asia/Seoul")).date().isoformat()
+        
+        result = {
+            "device_id": deviceid,
+            "date": today,
+            "energy_kwh": energy,
+            "wire_type": wire_type
+        }
+        
+        logger.info(f"오늘 에너지 조회 성공: device={deviceid}, energy={energy} kWh")
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"오늘 에너지 조회 실패: device={deviceid}, error={str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.get("/statistics")
+async def get_statistics(
+    deviceid: int = Query(..., description="Device ID (11-15)", alias="deviceid"),
+    days: int = Query(7, description="Statistics period (days)", ge=1, le=365)
+) -> Dict[str, Any]:
+    """
+    Modbus 통계 조회 (최근 N일간)
+    
+    Parameters:
+        - deviceid: 디바이스 ID (11~15)
+        - days: 통계 기간 (일)
+        
+    Returns:
+        {
+            "device_id": int,
+            "total_energy_kwh": float,
+            "avg_power_kw": float,
+            "peak_power_kw": float,
+            "period_days": int,
+            "wire_type": "4wire" | "3wire"
+        }
+    """
+    try:
+        if deviceid not in range(11, 16):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid device_id: {deviceid}. Must be 11-15"
+            )
+        
+        result = modbus_service.get_device_statistics(device_id=deviceid, days=days)
+        result["device_id"] = deviceid
+        result["wire_type"] = "4wire" if modbus_service._is_4wire(deviceid) else "3wire"
+        
+        logger.info(
+            f"Modbus 통계 조회 성공: device={deviceid}, days={days}, "
+            f"energy={result['total_energy_kwh']} kWh"
+        )
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Modbus 통계 조회 실패: device={deviceid}, error={str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")

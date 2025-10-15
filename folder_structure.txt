@@ -1,0 +1,173 @@
+project_root/
+├── src/
+│   ├── config/
+│   │   └── settings.py
+│   ├── db/
+│   │   ├── bootstrap.py
+│   │   └── client.py
+│   ├── collectors/
+│   │   ├── dummy_modbus_collector.py
+│   │   ├── dummy_env_collector.py  
+│   │   └── dummy_solar_collector.py
+│   ├── aggregators/     
+│   │   ├── __init__.py  
+│   │   └── aggregator.py
+│   ├── services/
+│   │   ├── modbus_service.py       
+│   │   ├── env_service.py          
+│   │   └── solar_service.py        
+│   ├── api/
+│   │   ├── modbus_router.py        
+│   │   ├── env_router.py           
+│   │   └── solar_router.py         
+│   └── common/
+│       └── logging_config.py
+├── main.py                          
+└── .env
+
+==================================================
+파일 목록
+1. settings.py (수정)
+✅ 3상 4선/3선 구분 수정 (11,12,13 = 4선, 14,15 = 3선)
+
+✅ 폴링 주기 변경 (60초 → 5초)
+
+✅ 헬퍼 메서드 추가 (is_4wire_device(), is_3wire_device())
+
+2. bootstrap.py (대폭 수정)
+✅ 센서 타입별 집계 테이블 생성
+
+Modbus: modbus_4wire_*, modbus_3wire_* (각 5개 해상도)
+
+Env: env_* (5개 해상도)
+
+Solar: solar_* (5개 해상도)
+
+✅ 기존 데이터 마이그레이션 함수 (migrate_existing_data())
+
+✅ 총 20개 집계 테이블 생성
+
+3. Collectors (3개 파일 수정)
+dummy_modbus_collector.py:
+
+✅ 에너지 누적값 구현 (_energy_state)
+
+✅ 타입별 전압 컬럼 자동 선택
+
+✅ 현실적인 물리 관계 반영
+
+dummy_env_collector.py:
+
+✅ 센서별 위치 특성 추가
+
+✅ 에러 처리 강화
+
+dummy_solar_collector.py:
+
+✅ 시간대별 일사량 패턴 (sin 곡선)
+
+✅ 밤/낮 자동 구분
+
+4. aggregator.py (🆕 신규 생성)
+✅ 1분마다: 원시 데이터 → 1분 집계
+
+✅ 15분마다: 1분 → 15분 집계
+
+✅ 1시간마다: 15분 → 1시간 집계
+
+✅ 1일마다: 1시간 → 1일 집계
+
+✅ 백그라운드 스레드로 자동 실행
+
+5. Services (3개 파일 수정)
+modbus_service.py:
+
+✅ 집계 테이블에서 조회
+
+✅ preset에 따라 해상도 자동 선택
+
+✅ 3선/4선 자동 구분
+
+✅ 피크 전력, 에너지 delta 제공
+
+env_service.py:
+
+✅ 집계 테이블에서 조회
+
+✅ min/max 온도/습도 제공
+
+✅ 쾌적도 지수 계산 (신규)
+
+solar_service.py:
+
+✅ 집계 테이블에서 조회
+
+✅ 발전 효율 추정 (신규)
+
+✅ 일조 시간 계산 (신규)
+
+6. Routers (3개 파일 수정)
+modbus_router.py:
+
+/data/modbus/query - 시계열 데이터
+
+/data/modbus/realtime - 실시간 데이터
+
+/data/modbus/today-energy - 오늘 누적 에너지
+
+/data/modbus/statistics - 통계
+
+env_router.py:
+
+/data/env/query - 시계열 데이터
+
+/data/env/realtime - 실시간 데이터
+
+/data/env/statistics - 통계
+
+/data/env/comfort - 쾌적도 지수
+
+solar_router.py:
+
+/data/solar/query - 시계열 데이터
+
+/data/solar/realtime - 실시간 데이터
+
+/data/solar/statistics - 통계
+
+/data/solar/efficiency - 발전 효율
+
+/data/solar/today-energy - 오늘 일사량
+
+7. main.py (수정)
+✅ 집계기 import 추가
+
+✅ lifespan에서 집계기 시작/종료
+
+✅ 시스템 정보 API 추가 (/api/info)
+
+=========================================================
+📊 데이터 흐름
+text
+[5초마다 수집]
+dummy_collectors → modbus_data (원본)
+                 → env_data (원본)
+                 → solar_data (원본)
+
+[1분마다 집계]
+aggregator → modbus_4wire_1min
+          → modbus_3wire_1min
+          → env_1min
+          → solar_1min
+
+[15분마다 집계]
+aggregator → *_15min 테이블들
+
+[1시간마다 집계]
+aggregator → *_1hour 테이블들
+
+[1일마다 집계]
+aggregator → *_1day 테이블들
+
+[API 조회]
+router → service → 적절한 집계 테이블 선택 → 응답

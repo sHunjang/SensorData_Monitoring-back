@@ -703,10 +703,12 @@ class AggregatorManager:
         log.info("   1day aggregation: every 1day")
         log.info("=" * 70)
         
-        last_1min = datetime.min
-        last_15min = datetime.min
-        last_1hour = datetime.min
-        last_1day = datetime.min
+        # ✅ 수정 후 (KST timezone 추가)
+        now_kst = datetime.now(KST)
+        last_1min = now_kst - timedelta(days=365)  # 충분히 과거 시점
+        last_15min = now_kst - timedelta(days=365)
+        last_1hour = now_kst - timedelta(days=365)
+        last_1day = now_kst - timedelta(days=365)
         
         while not self._stop_event.is_set():
             try:
