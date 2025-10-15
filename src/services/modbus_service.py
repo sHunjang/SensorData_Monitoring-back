@@ -6,6 +6,7 @@ Modbus(전력량계) 서비스 모듈
 - 3상 4선식 / 3상 3선식 자동 구분
 - 실시간 데이터 조회 (원시 데이터 우선, 1분 집계 fallback)
 - 오늘 누적 에너지 계산
+- **커스텀 시간 범위 지원 (ISO 8601 형식: .000Z 포함)**
 
 데이터 소스:
 - 실시간: modbus_data (원시 데이터) → modbus_*wire_1min (fallback)
@@ -14,10 +15,12 @@ Modbus(전력량계) 서비스 모듈
 - 1달 그래프: modbus_*wire_1hour (1시간 집계)
 - 1년 그래프: modbus_*wire_1day (1일 집계)
 
-*** 주요 수정 사항 ***
+*** 최종 수정 사항 ***
+✅ ISO 8601 파싱 개선: .000Z, Z, +09:00 모두 지원
+✅ 커스텀 범위 우선 처리: start/end가 있으면 preset 무시
 ✅ 실시간 데이터 fallback: 원시 데이터가 없으면 1분 집계 테이블 최신 데이터 사용
 ✅ 집계 테이블 사용: modbus_4wire_*, modbus_3wire_* 테이블에서 조회
-✅ 자동 해상도 선택: preset에 따라 적절한 집계 테이블 자동 선택
+✅ 자동 해상도 선택: preset 또는 범위에 따라 적절한 집계 테이블 자동 선택
 ✅ 3선/4선 자동 구분: settings.is_4wire_device() 활용
 ✅ 피크 전력 지원: 15분 이후 해상도에서 피크 전력 제공
 ✅ 에너지 delta: 구간별 소비량 제공 (energy_delta_kwh)
@@ -72,6 +75,44 @@ def _get_table_and_columns(device_id: int, resolution: str) -> tuple:
     return table_name, voltage_col, energy_available
 
 
+def _parse_iso_datetime(iso_str: str) -> datetime:
+    """
+    ISO 8601 형식 파싱 (Python 3.10+ 호환)
+    
+    지원 형식:
+    - 2025-10-14T08:20:00.000Z
+    - 2025-10-14T08:20:00Z
+    - 2025-10-14T08:20:00+09:00
+    - 2025-10-14T08:20:00
+    
+    Args:
+        iso_str: ISO 8601 형식 문자열
+        
+    Returns:
+        KST 타임존의 datetime 객체
+    """
+    # 1. 'Z'를 '+00:00'으로 변환 (UTC 표시)
+    if iso_str.endswith('Z'):
+        iso_str = iso_str[:-1] + '+00:00'
+    
+    # 2. datetime 파싱
+    try:
+        dt = datetime.fromisoformat(iso_str)
+    except ValueError as e:
+        # Python 3.10에서도 실패할 경우 (예: 이상한 포맷)
+        raise ValueError(f"Invalid ISO format: {iso_str}") from e
+    
+    # 3. 타임존 처리
+    if dt.tzinfo is None:
+        # 타임존 없음 -> KST로 간주
+        dt = dt.replace(tzinfo=KST)
+    else:
+        # 다른 타임존 -> KST로 변환
+        dt = dt.astimezone(KST)
+    
+    return dt
+
+
 # ============================================================
 # 시간 범위 및 해상도 결정
 # ============================================================
@@ -84,6 +125,11 @@ def _determine_resolution_and_range(
     """
     요청 파라미터로부터 시간 범위와 조회할 해상도 결정
     
+    **우선순위**:
+    1. start/end가 있으면 커스텀 범위 (preset 무시)
+    2. preset이 있으면 고정 범위
+    3. 둘 다 없으면 오늘 (기본값)
+    
     Args:
         preset: "1day", "1week", "1month", "1year"
         start: 시작 시각 (ISO format)
@@ -95,43 +141,19 @@ def _determine_resolution_and_range(
     """
     now = datetime.now(KST)
     
-    if preset:
-        if preset == "1day":
-            start_dt = datetime.combine(now.date(), time(0, 0, 0), tzinfo=KST)
-            end_dt = start_dt + timedelta(days=1)
-            resolution = "1min"
-            
-        elif preset == "1week":
-            start_dt = now - timedelta(days=7)
-            end_dt = now
-            resolution = "15min"
-            
-        elif preset == "1month":
-            start_dt = now - timedelta(days=30)
-            end_dt = now
-            resolution = "1hour"
-            
-        elif preset == "1year":
-            start_dt = now - timedelta(days=365)
-            end_dt = now
-            resolution = "1day"
-            
-        else:
-            start_dt = datetime.combine(now.date(), time(0, 0, 0), tzinfo=KST)
-            end_dt = start_dt + timedelta(days=1)
-            resolution = "1min"
-    
-    elif start and end:
-        start_dt = datetime.fromisoformat(start)
-        end_dt = datetime.fromisoformat(end)
+    # ==========================================
+    # 1. 커스텀 범위 우선 (start/end가 있으면)
+    # ==========================================
+    if start and end:
+        start_dt = _parse_iso_datetime(start)
+        end_dt = _parse_iso_datetime(end)
         
-        if start_dt.tzinfo is None:
-            start_dt = start_dt.replace(tzinfo=KST)
-        if end_dt.tzinfo is None:
-            end_dt = end_dt.replace(tzinfo=KST)
-        
+        # 범위에 따라 해상도 자동 결정
         delta = end_dt - start_dt
-        if delta <= timedelta(days=1):
+        
+        if delta <= timedelta(hours=6):
+            resolution = "1min"
+        elif delta <= timedelta(days=1):
             resolution = "1min"
         elif delta <= timedelta(days=7):
             resolution = "15min"
@@ -139,8 +161,59 @@ def _determine_resolution_and_range(
             resolution = "1hour"
         else:
             resolution = "1day"
+        
+        return start_dt, end_dt, resolution
     
+    # ==========================================
+    # 2. Preset 모드 (start/end가 없을 때만)
+    # ==========================================
+    if preset:
+        if preset == "1day":
+            # 오늘 00:00 ~ 23:59
+            start_dt = datetime.combine(now.date(), time(0, 0, 0), tzinfo=KST)
+            end_dt = start_dt + timedelta(days=1)
+            resolution = "1min"
+            
+        elif preset == "1week":
+            # 이번 주 월요일 00:00 ~ 일요일 23:59
+            today = now.date()
+            weekday = today.weekday()  # 0=월요일, 6=일요일
+            monday = today - timedelta(days=weekday)
+            start_dt = datetime.combine(monday, time(0, 0, 0), tzinfo=KST)
+            sunday = monday + timedelta(days=6)
+            end_dt = datetime.combine(sunday, time(23, 59, 59), tzinfo=KST)
+            resolution = "15min"
+            
+        elif preset == "1month":
+            # 이번 달 1일 00:00 ~ 말일 23:59
+            year = now.year
+            month = now.month
+            start_dt = datetime(year, month, 1, 0, 0, 0, tzinfo=KST)
+            
+            # 말일 계산
+            if month == 12:
+                next_month = datetime(year + 1, 1, 1, 0, 0, 0, tzinfo=KST)
+            else:
+                next_month = datetime(year, month + 1, 1, 0, 0, 0, tzinfo=KST)
+            
+            last_day = (next_month - timedelta(days=1)).day
+            end_dt = datetime(year, month, last_day, 23, 59, 59, tzinfo=KST)
+            resolution = "1hour"
+            
+        elif preset == "1year":
+            # 올해 1월 1일 ~ 12월 31일
+            year = now.year
+            start_dt = datetime(year, 1, 1, 0, 0, 0, tzinfo=KST)
+            end_dt = datetime(year, 12, 31, 23, 59, 59, tzinfo=KST)
+            resolution = "1day"
+            
+        else:
+            # 알 수 없는 preset -> 오늘
+            start_dt = datetime.combine(now.date(), time(0, 0, 0), tzinfo=KST)
+            end_dt = start_dt + timedelta(days=1)
+            resolution = "1min"
     else:
+        # 기본값: 오늘
         start_dt = datetime.combine(now.date(), time(0, 0, 0), tzinfo=KST)
         end_dt = start_dt + timedelta(days=1)
         resolution = "1min"

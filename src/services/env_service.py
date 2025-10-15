@@ -12,19 +12,6 @@
 - 1주 그래프: env_15min (15분 집계)
 - 1달 그래프: env_1hour (1시간 집계)
 - 1년 그래프: env_1day (1일 집계)
-
-*** 주요 수정 사항 ***
-✅ 집계 테이블 사용: 원시 env_data 대신 env_1min, env_15min, env_1hour, env_1day 테이블에서 조회​
-
-✅ 자동 해상도 선택: preset에 따라 적절한 집계 테이블 자동 선택
-
-✅ min/max 값 제공: 집계 테이블에서 최소/최대 온도/습도 제공
-
-✅ 실시간 조회: query_env_realtime() - 원시 데이터에서 최신 1건 조회
-
-✅ 통계 함수: get_env_statistics() - 최근 N일 통계
-
-✅ 쾌적도 지수: get_comfort_index() - 온도/습도 기반 쾌적도 계산 (추가 기능)
 """
 
 from typing import Any, Dict, List, Optional
@@ -48,6 +35,8 @@ def _determine_resolution_and_range(
     """
     요청 파라미터로부터 시간 범위와 조회할 해상도 결정
     
+    ✅ 수정: preset이 있으면 해당 해상도 고정, start/end와 함께 사용
+    
     Args:
         preset: "1day", "1week", "1month", "1year"
         start: 시작 시각 (ISO format)
@@ -59,29 +48,62 @@ def _determine_resolution_and_range(
     """
     now = datetime.now(KST)
     
+    # ✅ 헬퍼 함수: ISO 문자열을 KST datetime으로 변환
+    def parse_iso_to_kst(iso_str: str) -> datetime:
+        """ISO 8601 문자열을 KST datetime으로 변환"""
+        # ✅ .000Z 포맷 제거 (Python 3.11+ 호환)
+        iso_str = iso_str.replace('.000Z', 'Z').replace('Z', '+00:00')
+        
+        dt = datetime.fromisoformat(iso_str)
+        
+        # UTC → KST 변환
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=KST)
+        else:
+            dt = dt.astimezone(KST)
+        
+        return dt
+    
+    # ✅ preset이 있으면 해당 해상도 고정
     if preset:
         if preset == "1day":
-            # 하루 단위: 오늘 00:00 ~ 23:59, 1분 집계 사용
-            start_dt = datetime.combine(now.date(), time(0, 0, 0), tzinfo=KST)
-            end_dt = start_dt + timedelta(days=1)
+            if start and end:
+                start_dt = parse_iso_to_kst(start)
+                end_dt = parse_iso_to_kst(end)
+            else:
+                start_dt = datetime.combine(now.date(), time(0, 0, 0), tzinfo=KST)
+                end_dt = start_dt + timedelta(days=1)
+            
             resolution = "1min"
             
         elif preset == "1week":
-            # 1주 단위: 최근 7일, 15분 집계 사용
-            start_dt = now - timedelta(days=7)
-            end_dt = now
+            if start and end:
+                start_dt = parse_iso_to_kst(start)
+                end_dt = parse_iso_to_kst(end)
+            else:
+                start_dt = now - timedelta(days=7)
+                end_dt = now
+            
             resolution = "15min"
             
         elif preset == "1month":
-            # 1달 단위: 최근 30일, 1시간 집계 사용
-            start_dt = now - timedelta(days=30)
-            end_dt = now
+            if start and end:
+                start_dt = parse_iso_to_kst(start)
+                end_dt = parse_iso_to_kst(end)
+            else:
+                start_dt = now - timedelta(days=30)
+                end_dt = now
+            
             resolution = "1hour"
             
         elif preset == "1year":
-            # 1년 단위: 최근 365일, 1일 집계 사용
-            start_dt = now - timedelta(days=365)
-            end_dt = now
+            if start and end:
+                start_dt = parse_iso_to_kst(start)
+                end_dt = parse_iso_to_kst(end)
+            else:
+                start_dt = now - timedelta(days=365)
+                end_dt = now
+            
             resolution = "1day"
             
         else:
@@ -91,15 +113,9 @@ def _determine_resolution_and_range(
             resolution = "1min"
     
     elif start and end:
-        # 직접 시간 범위 지정
-        start_dt = datetime.fromisoformat(start)
-        end_dt = datetime.fromisoformat(end)
-        
-        # timezone 처리
-        if start_dt.tzinfo is None:
-            start_dt = start_dt.replace(tzinfo=KST)
-        if end_dt.tzinfo is None:
-            end_dt = end_dt.replace(tzinfo=KST)
+        # preset 없이 직접 시간 범위 지정
+        start_dt = parse_iso_to_kst(start)
+        end_dt = parse_iso_to_kst(end)
         
         # 범위에 따라 자동으로 해상도 결정
         delta = end_dt - start_dt
