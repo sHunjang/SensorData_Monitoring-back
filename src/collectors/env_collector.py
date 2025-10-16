@@ -1,8 +1,10 @@
 # src/collectors/env_collector.py
 
+
 """
 환경센서(온도·습도) 수집기 - TimescaleDB 연동
 """
+
 
 import time
 import logging
@@ -10,17 +12,20 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Dict
 
+
 from src.config.settings import settings
 from src.db.client import get_cursor
 from src.sensors.env_reader import create_instrument, read_env_sensor
+
 
 log = logging.getLogger("env_collector")
 KST = ZoneInfo("Asia/Seoul")
 
 
+
 def ensure_table():
     """
-    TimescaleDB 하이퍼테이블 및 연속 집계 생성
+    TimescaleDB 하이퍼테이블 및 연속 집계 생성 (기존 데이터 보존)
     """
     with get_cursor() as cur:
         # 1. 원본 테이블
@@ -33,15 +38,20 @@ def ensure_table():
             );
         """)
         
-        # 2. 하이퍼테이블
-        cur.execute("""
-            SELECT create_hypertable(
-                'env_data', 
-                'time_stamp',
-                if_not_exists => TRUE,
-                chunk_time_interval => INTERVAL '7 days'
-            );
-        """)
+        # 2. 하이퍼테이블 변환 (✅ migrate_data => TRUE 추가)
+        try:
+            cur.execute("""
+                SELECT create_hypertable(
+                    'env_data', 
+                    'time_stamp',
+                    if_not_exists => TRUE,
+                    migrate_data => TRUE,
+                    chunk_time_interval => INTERVAL '7 days'
+                );
+            """)
+            log.info("✅ env_data 하이퍼테이블 변환 완료 (기존 데이터 보존)")
+        except Exception as e:
+            log.info(f"✅ env_data 이미 하이퍼테이블로 존재함")
         
         # 3. 인덱스
         cur.execute("""
@@ -56,18 +66,22 @@ def ensure_table():
             ('1hour', '1 hour'),
             ('1day', '1 day')
         ]:
-            cur.execute(f"""
-                CREATE MATERIALIZED VIEW IF NOT EXISTS env_data_{interval_name}
-                WITH (timescaledb.continuous) AS
-                SELECT
-                    time_bucket('{interval_str}', time_stamp) AS bucket,
-                    device_id,
-                    AVG(temperature) AS temperature,
-                    AVG(humidity) AS humidity
-                FROM env_data
-                GROUP BY bucket, device_id
-                WITH NO DATA;
-            """)
+            try:
+                cur.execute(f"""
+                    CREATE MATERIALIZED VIEW IF NOT EXISTS env_data_{interval_name}
+                    WITH (timescaledb.continuous) AS
+                    SELECT
+                        time_bucket('{interval_str}', time_stamp) AS bucket,
+                        device_id,
+                        AVG(temperature) AS temperature,
+                        AVG(humidity) AS humidity
+                    FROM env_data
+                    GROUP BY bucket, device_id
+                    WITH NO DATA;
+                """)
+                log.info(f"✅ env_data_{interval_name} 연속 집계 생성 완료")
+            except Exception as e:
+                log.debug(f"env_data_{interval_name} 이미 존재: {e}")
             
             # 자동 갱신 정책
             try:
@@ -80,9 +94,10 @@ def ensure_table():
                     );
                 """)
             except Exception as e:
-                log.warning(f"⚠️ Policy for env_data_{interval_name}: {e}")
+                log.debug(f"⚠️ Policy for env_data_{interval_name}: {e}")
         
         log.info("✅ TimescaleDB 하이퍼테이블 및 연속 집계 준비 완료 (env)")
+
 
 
 def insert_row(device_id: int, payload: Dict[str, float]):
@@ -102,6 +117,7 @@ def insert_row(device_id: int, payload: Dict[str, float]):
                      device_id, temp or 0, humi or 0)
     except Exception:
         log.exception("❌ DB insert failed for device=%s", device_id)
+
 
 
 def run_once_for_device(device_id: int, fail_counts: dict):
@@ -126,6 +142,7 @@ def run_once_for_device(device_id: int, fail_counts: dict):
         fail_counts[device_id] = fail_counts.get(device_id, 0) + 1
         log.warning("⚠️ env read fail device=%s count=%s err=%s", 
                    device_id, fail_counts[device_id], e)
+
 
 
 def main():
@@ -157,6 +174,7 @@ def main():
             run_once_for_device(sid, fail_counts)
         
         time.sleep(interval)
+
 
 
 if __name__ == "__main__":
