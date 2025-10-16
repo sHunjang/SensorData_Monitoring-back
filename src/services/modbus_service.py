@@ -246,6 +246,9 @@ def query_modbus_data(
                 avg_current_a AS current,
                 avg_active_power_kw AS power,
                 energy_delta_kwh AS energy_delta,
+                avg_reactive_power_kvar AS reactive_power,
+                avg_apparent_power_kva AS apparent_power,
+                avg_power_factor AS power_factor,
                 data_points
             FROM {table_name}
             WHERE device_id = %s
@@ -263,6 +266,9 @@ def query_modbus_data(
                 peak_power_kw AS power,
                 energy_delta_kwh AS energy_delta,
                 peak_power_kw AS peak_power,
+                NULL AS reactive_power,
+                NULL AS apparent_power,
+                NULL AS power_factor,
                 data_points
             FROM {table_name}
             WHERE device_id = %s
@@ -290,6 +296,12 @@ def query_modbus_data(
             "energy_delta": round(row[4], 3) if row[4] is not None else None,
         }
         
+        if resolution == "1min":
+            item["reactive_power"] = round(row[5], 2) if row[5] is not None else None
+            item["apparent_power"] = round(row[6], 2) if row[6] is not None else None
+            item["power_factor"] = round(row[7], 3) if row[7] is not None else None
+        
+        
         if resolution != "1min" and len(row) > 5:
             item["peak_power"] = round(row[5], 2) if row[5] is not None else None
         
@@ -314,24 +326,9 @@ def query_modbus_realtime(device_id: int) -> Optional[Dict[str, Any]]:
     """
     최신 데이터 1건 조회 (실시간 모니터링용)
     
-    1차 시도: modbus_data (원시 데이터)
-    2차 시도: modbus_*wire_1min (1분 집계 최신)
-    
-    Args:
-        device_id: 디바이스 ID
-        
-    Returns:
-        dict 또는 None
-        {
-            "time_stamp": ISO string (KST),
-            "device_id": int,
-            "voltage": float,
-            "current": float,
-            "power": float,
-            "energy": float (누적값, 1분 집계에서는 None)
-        }
+    ✅ 수정: 무효전력, 피상전력, 역률 추가
     """
-    # ✅ 1차 시도: 원시 데이터 (modbus_data)
+    # 1차 시도: 원시 데이터 (modbus_data)
     voltage_col_raw = "avg_line_to_line_volts_v" if _is_4wire(device_id) else "avg_line_to_neutral_volts_v"
     
     sql_raw = f"""
@@ -341,7 +338,12 @@ def query_modbus_realtime(device_id: int) -> Optional[Dict[str, Any]]:
             {voltage_col_raw} AS voltage,
             sum_line_currents_a AS current,
             total_active_power_kw AS power,
-            total_active_energy_kwh AS energy
+            total_active_energy_kwh AS energy,
+            total_reactive_power_kvar AS reactive_power,
+            total_apparent_power_kva AS apparent_power,
+            total_power_factor AS power_factor,
+            total_reactive_energy_kvarh AS reactive_energy,
+            total_apparent_energy_kvah AS apparent_energy
         FROM modbus_data
         WHERE device_id = %s
         ORDER BY time_stamp DESC
@@ -352,7 +354,6 @@ def query_modbus_realtime(device_id: int) -> Optional[Dict[str, Any]]:
         cur.execute(sql_raw, (device_id,))
         row = cur.fetchone()
     
-    # ✅ 원시 데이터가 있으면 반환
     if row and row[0]:
         ts = row[0]
         if ts.tzinfo is None:
@@ -365,9 +366,15 @@ def query_modbus_realtime(device_id: int) -> Optional[Dict[str, Any]]:
             "current": round(row[3], 2) if row[3] is not None else None,
             "power": round(row[4], 2) if row[4] is not None else None,
             "energy": round(row[5], 3) if row[5] is not None else None,
+            # ✅ 추가 데이터
+            "reactive_power": round(row[6], 2) if row[6] is not None else None,
+            "apparent_power": round(row[7], 2) if row[7] is not None else None,
+            "power_factor": round(row[8], 3) if row[8] is not None else None,
+            "reactive_energy": round(row[9], 3) if row[9] is not None else None,
+            "apparent_energy": round(row[10], 3) if row[10] is not None else None,
         }
     
-    # ✅ 2차 시도: 1분 집계 테이블 최신 데이터 (fallback)
+    # 2차 시도: 1분 집계 테이블 (무효전력, 피상전력 포함)
     wire_type = "4wire" if _is_4wire(device_id) else "3wire"
     table_1min = f"modbus_{wire_type}_1min"
     voltage_col_agg = "avg_voltage_ll_v" if _is_4wire(device_id) else "avg_voltage_ln_v"
@@ -377,7 +384,10 @@ def query_modbus_realtime(device_id: int) -> Optional[Dict[str, Any]]:
             bucket,
             {voltage_col_agg} AS voltage,
             avg_current_a AS current,
-            avg_active_power_kw AS power
+            avg_active_power_kw AS power,
+            avg_reactive_power_kvar AS reactive_power,
+            avg_apparent_power_kva AS apparent_power,
+            avg_power_factor AS power_factor
         FROM {table_1min}
         WHERE device_id = %s
         ORDER BY bucket DESC
@@ -402,7 +412,14 @@ def query_modbus_realtime(device_id: int) -> Optional[Dict[str, Any]]:
         "current": round(row[2], 2) if row[2] is not None else None,
         "power": round(row[3], 2) if row[3] is not None else None,
         "energy": None,  # 1분 집계에는 누적 에너지 없음
+        # ✅ 추가 데이터
+        "reactive_power": round(row[4], 2) if row[4] is not None else None,
+        "apparent_power": round(row[5], 2) if row[5] is not None else None,
+        "power_factor": round(row[6], 3) if row[6] is not None else None,
+        "reactive_energy": None,
+        "apparent_energy": None,
     }
+
 
 
 # ============================================================
@@ -418,11 +435,11 @@ def get_today_energy_kwh(device_id: int) -> Optional[float]:
     
     wire_type = "4wire" if _is_4wire(device_id) else "3wire"
     
-    # 1차 시도: 1일 집계 테이블
-    table_1day = f"modbus_{wire_type}_1day"
+    # 1차 시도: 1분 집계 테이블
+    table_1min = f"modbus_{wire_type}_1min"
     sql_1day = f"""
         SELECT energy_delta_kwh
-        FROM {table_1day}
+        FROM {table_1min}
         WHERE device_id = %s
           AND bucket = %s
         LIMIT 1;
@@ -434,12 +451,12 @@ def get_today_energy_kwh(device_id: int) -> Optional[float]:
         if row and row[0] is not None:
             return round(float(row[0]), 3)
     
-    # 2차 시도: 1시간 집계 테이블 합산
-    table_1hour = f"modbus_{wire_type}_1hour"
+    # 2차 시도: 15분 집계 테이블 합산
+    table_15min = f"modbus_{wire_type}_15min"
     tomorrow_start = today_start + timedelta(days=1)
     sql_1hour = f"""
         SELECT SUM(energy_delta_kwh)
-        FROM {table_1hour}
+        FROM {table_15min}
         WHERE device_id = %s
           AND bucket >= %s
           AND bucket < %s;
