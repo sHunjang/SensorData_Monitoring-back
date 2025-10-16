@@ -503,7 +503,7 @@ if __name__ == "__main__":
     
     # Uvicorn 서버 실행
     uvicorn.run(
-        "main:app",
+        app,
         host="0.0.0.0",
         port=port,
         reload=False,  # 프로덕션 모드에서는 reload 비활성화
