@@ -163,3 +163,39 @@ async def get_statistics(
     except Exception as e:
         logger.error(f"통계 조회 실패: device={deviceid}, error={str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+# src/api/modbus_router.py
+# 기존 코드에 추가
+
+@router.get("/total-energy")
+async def get_total_energy(
+    deviceid: int = Query(..., description="Device ID (11-15)", alias="deviceid")
+) -> Dict[str, Any]:
+    """
+    총 누적 전력량 조회 (전력량계 시작부터 현재까지)
+    """
+    try:
+        if deviceid not in range(11, 16):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid device_id: {deviceid}. Must be 11-15"
+            )
+        
+        # 총 누적 전력량 조회
+        result = modbus_service.get_total_energy(device_id=deviceid)
+        
+        if not result or result.get("total_active_energy_kwh") is None:
+            raise HTTPException(status_code=404, detail="No data found")
+        
+        logger.info(
+            f"총 전력량 조회 성공: device={deviceid}, "
+            f"total_energy={result.get('total_active_energy_kwh')} kWh"
+        )
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"총 전력량 조회 실패: device={deviceid}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")

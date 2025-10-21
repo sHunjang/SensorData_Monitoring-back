@@ -3,9 +3,9 @@
 
 주요 기능:
 - 원시 데이터(5초 수집)를 다중 해상도로 자동 집계
-- 1분 → 15분 → 1시간 → 1일 → 1년 순차 집계
+- 1분 → 15분 → 1시간 → 1일 순차 집계
 - 백그라운드 스레드로 주기적 실행
-- 센서 타입별 집계 로직 분리
+- ✅ 시작 시 과거 전체 데이터 집계 지원
 
 집계 흐름:
   [원본 테이블 - 5초 수집]
@@ -17,8 +17,6 @@
   [1시간 테이블] → 1달 단위 그래프용
     ↓ 1일마다 집계
   [1일 테이블] → 1년 단위 그래프용
-    ↓ 1년마다 집계
-  [1년 테이블] → 장기 통계용
 
 사용법:
   # main.py에서 자동 실행
@@ -40,7 +38,6 @@ from src.db.client import get_cursor
 from src.config.settings import settings
 
 log = logging.getLogger("aggregator")
-
 KST = ZoneInfo("Asia/Seoul")
 
 
@@ -52,14 +49,9 @@ def aggregate_modbus_4wire_to_1min():
     """
     modbus_data (4선식) → modbus_4wire_1min 집계
     
-    동작:
-    - 최근 1분간의 원시 데이터를 조회
-    - 평균/최소/최대 계산
-    - 에너지 delta 계산 (시작값 - 종료값)
-    - ON CONFLICT 시 업데이트
+    ✅ 수정: 과거 30일치 데이터 모두 집계
     """
     with get_cursor() as cur:
-        # 최근 2분치 데이터를 1분 단위로 집계 (안전 마진)
         cur.execute("""
             INSERT INTO modbus_4wire_1min (
                 bucket, device_id,
@@ -88,7 +80,7 @@ def aggregate_modbus_4wire_to_1min():
                 COUNT(*)
             FROM modbus_data
             WHERE device_id IN (11, 12, 13)
-              AND time_stamp >= NOW() - INTERVAL '2 minutes'
+              AND time_stamp >= NOW() - INTERVAL '30 days'  -- ✅ 30일로 확장
             GROUP BY bucket, device_id
             ON CONFLICT (bucket, device_id) DO UPDATE SET
                 avg_voltage_ll_v = EXCLUDED.avg_voltage_ll_v,
@@ -115,12 +107,9 @@ def aggregate_modbus_4wire_to_15min():
     """
     modbus_4wire_1min → modbus_4wire_15min 집계
     
-    특징:
-    - 15분 이후부터는 에너지(kWh) 데이터만 저장
-    - 피크 전력 계산 (15분 구간 최대값)
+    ✅ 수정: 과거 30일치 데이터 모두 집계
     """
     with get_cursor() as cur:
-        # 최근 30분치 데이터를 15분 단위로 집계
         cur.execute("""
             INSERT INTO modbus_4wire_15min (
                 bucket, device_id,
@@ -134,10 +123,10 @@ def aggregate_modbus_4wire_to_15min():
                 MIN(energy_start_kwh),
                 MAX(energy_end_kwh),
                 MAX(energy_end_kwh) - MIN(energy_start_kwh),
-                MAX(avg_active_power_kw),  -- 피크 전력
+                MAX(avg_active_power_kw),
                 SUM(data_points)
             FROM modbus_4wire_1min
-            WHERE bucket >= NOW() - INTERVAL '30 minutes'
+            WHERE bucket >= NOW() - INTERVAL '30 days'  -- ✅ 30일로 확장
             GROUP BY 
                 date_trunc('hour', bucket) + 
                     INTERVAL '15 min' * FLOOR(EXTRACT(MINUTE FROM bucket) / 15),
@@ -155,7 +144,11 @@ def aggregate_modbus_4wire_to_15min():
 
 
 def aggregate_modbus_4wire_to_1hour():
-    """modbus_4wire_15min → modbus_4wire_1hour 집계"""
+    """
+    modbus_4wire_15min → modbus_4wire_1hour 집계
+    
+    ✅ 수정: 과거 30일치 데이터 모두 집계
+    """
     with get_cursor() as cur:
         cur.execute("""
             INSERT INTO modbus_4wire_1hour (
@@ -172,7 +165,7 @@ def aggregate_modbus_4wire_to_1hour():
                 MAX(peak_power_kw),
                 SUM(data_points)
             FROM modbus_4wire_15min
-            WHERE bucket >= NOW() - INTERVAL '2 hours'
+            WHERE bucket >= NOW() - INTERVAL '30 days'  -- ✅ 30일로 확장
             GROUP BY date_trunc('hour', bucket), device_id
             ON CONFLICT (bucket, device_id) DO UPDATE SET
                 energy_start_kwh = EXCLUDED.energy_start_kwh,
@@ -187,7 +180,11 @@ def aggregate_modbus_4wire_to_1hour():
 
 
 def aggregate_modbus_4wire_to_1day():
-    """modbus_4wire_1hour → modbus_4wire_1day 집계"""
+    """
+    modbus_4wire_1hour → modbus_4wire_1day 집계
+    
+    ✅ 수정: 과거 30일치 데이터 모두 집계
+    """
     with get_cursor() as cur:
         cur.execute("""
             INSERT INTO modbus_4wire_1day (
@@ -204,7 +201,7 @@ def aggregate_modbus_4wire_to_1day():
                 MAX(peak_power_kw),
                 SUM(data_points)
             FROM modbus_4wire_1hour
-            WHERE bucket >= NOW() - INTERVAL '2 days'
+            WHERE bucket >= NOW() - INTERVAL '30 days'  -- ✅ 30일로 확장
             GROUP BY date_trunc('day', bucket), device_id
             ON CONFLICT (bucket, device_id) DO UPDATE SET
                 energy_start_kwh = EXCLUDED.energy_start_kwh,
@@ -253,7 +250,7 @@ def aggregate_modbus_3wire_to_1min():
                 COUNT(*)
             FROM modbus_data
             WHERE device_id IN (14, 15)
-              AND time_stamp >= NOW() - INTERVAL '2 minutes'
+              AND time_stamp >= NOW() - INTERVAL '30 days'  -- ✅ 30일로 확장
             GROUP BY bucket, device_id
             ON CONFLICT (bucket, device_id) DO UPDATE SET
                 avg_voltage_ln_v = EXCLUDED.avg_voltage_ln_v,
@@ -295,7 +292,7 @@ def aggregate_modbus_3wire_to_15min():
                 MAX(avg_active_power_kw),
                 SUM(data_points)
             FROM modbus_3wire_1min
-            WHERE bucket >= NOW() - INTERVAL '30 minutes'
+            WHERE bucket >= NOW() - INTERVAL '30 days'  -- ✅ 30일로 확장
             GROUP BY 
                 date_trunc('hour', bucket) + 
                     INTERVAL '15 min' * FLOOR(EXTRACT(MINUTE FROM bucket) / 15),
@@ -330,7 +327,7 @@ def aggregate_modbus_3wire_to_1hour():
                 MAX(peak_power_kw),
                 SUM(data_points)
             FROM modbus_3wire_15min
-            WHERE bucket >= NOW() - INTERVAL '2 hours'
+            WHERE bucket >= NOW() - INTERVAL '30 days'  -- ✅ 30일로 확장
             GROUP BY date_trunc('hour', bucket), device_id
             ON CONFLICT (bucket, device_id) DO UPDATE SET
                 energy_start_kwh = EXCLUDED.energy_start_kwh,
@@ -362,7 +359,7 @@ def aggregate_modbus_3wire_to_1day():
                 MAX(peak_power_kw),
                 SUM(data_points)
             FROM modbus_3wire_1hour
-            WHERE bucket >= NOW() - INTERVAL '2 days'
+            WHERE bucket >= NOW() - INTERVAL '30 days'  -- ✅ 30일로 확장
             GROUP BY date_trunc('day', bucket), device_id
             ON CONFLICT (bucket, device_id) DO UPDATE SET
                 energy_start_kwh = EXCLUDED.energy_start_kwh,
@@ -400,7 +397,7 @@ def aggregate_env_to_1min():
                 MAX(humidity),
                 COUNT(*)
             FROM env_data
-            WHERE time_stamp >= NOW() - INTERVAL '2 minutes'
+            WHERE time_stamp >= NOW() - INTERVAL '30 days'  -- ✅ 30일로 확장
             GROUP BY bucket, device_id
             ON CONFLICT (bucket, device_id) DO UPDATE SET
                 avg_temperature = EXCLUDED.avg_temperature,
@@ -437,7 +434,7 @@ def aggregate_env_to_15min():
                 MAX(max_humidity),
                 SUM(data_points)
             FROM env_1min
-            WHERE bucket >= NOW() - INTERVAL '30 minutes'
+            WHERE bucket >= NOW() - INTERVAL '30 days'  -- ✅ 30일로 확장
             GROUP BY 
                 date_trunc('hour', bucket) + 
                     INTERVAL '15 min' * FLOOR(EXTRACT(MINUTE FROM bucket) / 15),
@@ -476,7 +473,7 @@ def aggregate_env_to_1hour():
                 MAX(max_humidity),
                 SUM(data_points)
             FROM env_15min
-            WHERE bucket >= NOW() - INTERVAL '2 hours'
+            WHERE bucket >= NOW() - INTERVAL '30 days'  -- ✅ 30일로 확장
             GROUP BY date_trunc('hour', bucket), device_id
             ON CONFLICT (bucket, device_id) DO UPDATE SET
                 avg_temperature = EXCLUDED.avg_temperature,
@@ -512,7 +509,7 @@ def aggregate_env_to_1day():
                 MAX(max_humidity),
                 SUM(data_points)
             FROM env_1hour
-            WHERE bucket >= NOW() - INTERVAL '2 days'
+            WHERE bucket >= NOW() - INTERVAL '30 days'  -- ✅ 30일로 확장
             GROUP BY date_trunc('day', bucket), device_id
             ON CONFLICT (bucket, device_id) DO UPDATE SET
                 avg_temperature = EXCLUDED.avg_temperature,
@@ -548,7 +545,7 @@ def aggregate_solar_to_1min():
                 MAX(irradiance),
                 COUNT(*)
             FROM solar_data
-            WHERE time_stamp >= NOW() - INTERVAL '2 minutes'
+            WHERE time_stamp >= NOW() - INTERVAL '30 days'  -- ✅ 30일로 확장
             GROUP BY bucket, device_id
             ON CONFLICT (bucket, device_id) DO UPDATE SET
                 avg_irradiance = EXCLUDED.avg_irradiance,
@@ -578,7 +575,7 @@ def aggregate_solar_to_15min():
                 MAX(max_irradiance),
                 SUM(data_points)
             FROM solar_1min
-            WHERE bucket >= NOW() - INTERVAL '30 minutes'
+            WHERE bucket >= NOW() - INTERVAL '30 days'  -- ✅ 30일로 확장
             GROUP BY 
                 date_trunc('hour', bucket) + 
                     INTERVAL '15 min' * FLOOR(EXTRACT(MINUTE FROM bucket) / 15),
@@ -610,7 +607,7 @@ def aggregate_solar_to_1hour():
                 MAX(max_irradiance),
                 SUM(data_points)
             FROM solar_15min
-            WHERE bucket >= NOW() - INTERVAL '2 hours'
+            WHERE bucket >= NOW() - INTERVAL '30 days'  -- ✅ 30일로 확장
             GROUP BY date_trunc('hour', bucket), device_id
             ON CONFLICT (bucket, device_id) DO UPDATE SET
                 avg_irradiance = EXCLUDED.avg_irradiance,
@@ -639,7 +636,7 @@ def aggregate_solar_to_1day():
                 MAX(max_irradiance),
                 SUM(data_points)
             FROM solar_1hour
-            WHERE bucket >= NOW() - INTERVAL '2 days'
+            WHERE bucket >= NOW() - INTERVAL '30 days'  -- ✅ 30일로 확장
             GROUP BY date_trunc('day', bucket), device_id
             ON CONFLICT (bucket, device_id) DO UPDATE SET
                 avg_irradiance = EXCLUDED.avg_irradiance,
@@ -703,9 +700,8 @@ class AggregatorManager:
         log.info("   1day aggregation: every 1day")
         log.info("=" * 70)
         
-        # ✅ 수정 후 (KST timezone 추가)
         now_kst = datetime.now(KST)
-        last_1min = now_kst - timedelta(days=365)  # 충분히 과거 시점
+        last_1min = now_kst - timedelta(days=365)
         last_15min = now_kst - timedelta(days=365)
         last_1hour = now_kst - timedelta(days=365)
         last_1day = now_kst - timedelta(days=365)

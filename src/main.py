@@ -14,28 +14,9 @@
 🎯 main.py 역할:
 1. 운영 모드에 따라 실제/더미 수집기 선택 실행
 2. 집계기 자동 시작 (1분/15분/1시간/1일 집계)
-3. FastAPI 서버 및 React 프론트엔드 서빙
-4. PyInstaller EXE 환경 완벽 지원
-
-*** 주요 수정 사항 요약 ***
-    집계기 모듈 import 추가 (AggregatorManager)
-
-    lifespan 함수에 집계기 시작/중지 로직 추가
-
-    전역 변수로 aggregator_manager 관리
-
-    시스템 정보 API 추가 (/api/info) - 집계기 상태 확인용
-
-    로깅 메시지 개선 (더 명확한 시작/종료 메시지)
-
-    이제 서버를 시작하면:
-
-    수집기 → 5초마다 데이터 수집
-
-    집계기 → 1분/15분/1시간/1일마다 자동 집계
-
-    API → 집계된 데이터 제공
-
+3. **시작 시 과거 데이터 자동 집계** ← NEW!
+4. FastAPI 서버 및 React 프론트엔드 서빙
+5. PyInstaller EXE 환경 완벽 지원
 """
 
 import os
@@ -61,29 +42,15 @@ import uvicorn
 def get_resource_path(relative_path: str) -> str:
     """
     PyInstaller EXE와 개발환경 모두 지원하는 리소스 경로 반환
-    
-    Args:
-        relative_path: 상대 경로 ("dist", ".env" 등)
-        
-    Returns:
-        str: 실제 파일 시스템 경로
-        
-    동작:
-        - PyInstaller EXE: sys._MEIPASS 기준
-        - 개발 환경: 프로젝트 루트 기준
     """
     try:
-        # PyInstaller로 패키징된 EXE 실행시
         base_path = sys._MEIPASS
         print(f"🎯 PyInstaller 모드 감지: {base_path}")
     except AttributeError:
-        # 일반 Python 스크립트 실행시 (개발 환경)
         if relative_path == "dist":
-            # React 빌드 결과물은 프로젝트 루트/front/dist
             base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             resource_path = os.path.join(base_path, "front", "dist")
         else:
-            # 기타 리소스는 프로젝트 루트 기준
             base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             resource_path = os.path.join(base_path, relative_path)
         
@@ -91,7 +58,6 @@ def get_resource_path(relative_path: str) -> str:
         print(f"📁 리소스 경로 매핑: {relative_path} → {resource_path}")
         return resource_path
     
-    # PyInstaller 환경에서는 _MEIPASS 기준 경로 사용
     resource_path = os.path.join(base_path, relative_path)
     print(f"📦 PyInstaller 리소스: {relative_path} → {resource_path}")
     return resource_path
@@ -113,16 +79,9 @@ else:
 # 모듈 임포트 (단계별 로드)
 # ============================================================
 
-# 실제 센서용 모듈들
-REAL_COLLECTORS_LOADED = False
-
-# 더미 센서용 모듈들
+REAL_COLLECTORS_LOADED = True
 DUMMY_COLLECTORS_LOADED = False
-
-# API 라우터 모듈들
 API_ROUTERS_LOADED = False
-
-# 🔄 집계기 모듈
 AGGREGATOR_LOADED = False
 
 # 1. 실제 센서 수집기 로드 시도
@@ -206,16 +165,6 @@ aggregator_manager = None
 async def lifespan(app: FastAPI):
     """
     FastAPI 서버 시작/종료시 실행되는 라이프사이클 함수
-    
-    시작시 작업:
-    1. DB 스키마 초기화
-    2. 운영 모드에 따른 수집기 시작 (실제 vs 더미)
-    3. 집계기 시작 (1분/15분/1시간/1일 자동 집계)
-    4. 브라우저 자동 실행 (선택적)
-    
-    종료시 작업:
-    1. 집계기 안전 종료
-    2. 스레드 정리
     """
     global aggregator_manager
     
@@ -286,7 +235,7 @@ async def lifespan(app: FastAPI):
         def start_dummy_modbus():
             try:
                 log.info("🔌 더미 Modbus 수집기 시작")
-                dummy_modbus_collector.run_collector()  # settings에서 interval 자동 로드
+                dummy_modbus_collector.run_collector()
             except Exception as e:
                 log.exception(f"❌ 더미 Modbus 수집기 실패: {e}")
         
@@ -311,7 +260,7 @@ async def lifespan(app: FastAPI):
     else:
         log.warning("🚨 사용 가능한 수집기가 없습니다!")
     
-    # ============= 3단계: 집계기 시작 =============
+    # ============= 3단계: 집계기 시작 + 초기 집계 =============
     if AGGREGATOR_LOADED:
         try:
             log.info("")
@@ -321,6 +270,73 @@ async def lifespan(app: FastAPI):
             aggregator_manager = AggregatorManager()
             aggregator_manager.start()
             log.info("✅ 집계기 시작 완료 (1분/15분/1시간/1일 자동 집계)")
+            
+            # ✅ 추가: 시작 직후 과거 데이터 일괄 집계
+            log.info("")
+            log.info("=" * 70)
+            log.info("📊 초기 집계 실행 중 (과거 데이터 집계)...")
+            log.info("=" * 70)
+            
+            def run_initial_aggregation():
+                """시작 시 과거 데이터 일괄 집계"""
+                try:
+                    from src.aggregators.aggregator import (
+                        aggregate_modbus_4wire_to_1min,
+                        aggregate_modbus_4wire_to_15min,
+                        aggregate_modbus_4wire_to_1hour,
+                        aggregate_modbus_4wire_to_1day,
+                        aggregate_modbus_3wire_to_1min,
+                        aggregate_modbus_3wire_to_15min,
+                        aggregate_modbus_3wire_to_1hour,
+                        aggregate_modbus_3wire_to_1day,
+                        aggregate_env_to_1min,
+                        aggregate_env_to_15min,
+                        aggregate_env_to_1hour,
+                        aggregate_env_to_1day,
+                        aggregate_solar_to_1min,
+                        aggregate_solar_to_15min,
+                        aggregate_solar_to_1hour,
+                        aggregate_solar_to_1day,
+                    )
+                    
+                    log.info("🔄 1분 집계 실행...")
+                    aggregate_modbus_4wire_to_1min()
+                    aggregate_modbus_3wire_to_1min()
+                    aggregate_env_to_1min()
+                    aggregate_solar_to_1min()
+                    log.info("✅ 1분 집계 완료")
+                    
+                    log.info("🔄 15분 집계 실행...")
+                    aggregate_modbus_4wire_to_15min()
+                    aggregate_modbus_3wire_to_15min()
+                    aggregate_env_to_15min()
+                    aggregate_solar_to_15min()
+                    log.info("✅ 15분 집계 완료")
+                    
+                    log.info("🔄 1시간 집계 실행...")
+                    aggregate_modbus_4wire_to_1hour()
+                    aggregate_modbus_3wire_to_1hour()
+                    aggregate_env_to_1hour()
+                    aggregate_solar_to_1hour()
+                    log.info("✅ 1시간 집계 완료")
+                    
+                    log.info("🔄 1일 집계 실행...")
+                    aggregate_modbus_4wire_to_1day()
+                    aggregate_modbus_3wire_to_1day()
+                    aggregate_env_to_1day()
+                    aggregate_solar_to_1day()
+                    log.info("✅ 1일 집계 완료")
+                    
+                    log.info("=" * 70)
+                    log.info("✅ 초기 집계 완료! 과거 데이터 모두 집계됨")
+                    log.info("=" * 70)
+                    
+                except Exception as e:
+                    log.exception(f"❌ 초기 집계 실패: {e}")
+            
+            # 백그라운드 스레드로 초기 집계 실행 (서버 시작 블로킹 방지)
+            threading.Thread(target=run_initial_aggregation, daemon=True, name="initial_agg").start()
+            
         except Exception as e:
             log.exception(f"❌ 집계기 시작 실패: {e}")
             aggregator_manager = None
@@ -331,26 +347,13 @@ async def lifespan(app: FastAPI):
         log.warning("   데이터 수집은 되지만 1분/15분/... 테이블이 업데이트되지 않습니다")
         log.warning("=" * 70)
     
-    # ============= 4단계: 브라우저 자동 실행 (선택적) =============
-    # 필요시 주석 해제
-    # def open_browser():
-    #     import time
-    #     time.sleep(2)
-    #     try:
-    #         port = int(os.getenv("PORT", "8000"))
-    #         webbrowser.open(f"http://localhost:{port}")
-    #         log.info(f"🌐 브라우저 자동 실행: http://localhost:{port}")
-    #     except Exception as e:
-    #         log.warning(f"⚠️ 브라우저 자동 실행 실패: {e}")
-    # threading.Thread(target=open_browser, daemon=True, name="browser").start()
-    
     log.info("")
     log.info("=" * 70)
     log.info("✅ 센서 모니터링 시스템 시작 완료")
     log.info("=" * 70)
     
     # ============= 서버 실행 중 =============
-    yield  # FastAPI 서버가 실행되는 구간
+    yield
     
     # ============= 서버 종료시 정리 작업 =============
     log.info("")
@@ -358,7 +361,6 @@ async def lifespan(app: FastAPI):
     log.info("🛑 센서 모니터링 시스템 종료 중...")
     log.info("=" * 70)
     
-    # 집계기 중지
     if aggregator_manager:
         try:
             log.info("🔄 집계기 중지...")
@@ -393,7 +395,6 @@ app = FastAPI(
 if API_ROUTERS_LOADED:
     cors_origins = settings.get_cors_origins_list()
     if not cors_origins:
-        # 기본 개발용 origins
         cors_origins = [
             "http://localhost:3000",
             "http://localhost:5173",
@@ -410,7 +411,6 @@ if API_ROUTERS_LOADED:
     )
     log.info(f"✅ CORS 설정: {cors_origins}")
 else:
-    # API 라우터가 로드되지 않았을 때 기본 CORS
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -441,12 +441,7 @@ else:
 
 @app.get("/api/info")
 def get_system_info():
-    """
-    시스템 정보 조회
-    
-    Returns:
-        dict: 시스템 상태 정보
-    """
+    """시스템 정보 조회"""
     return {
         "title": "센서 모니터링 시스템",
         "version": "2.0.0",
@@ -467,7 +462,6 @@ def get_system_info():
 
 dist_path = get_resource_path("dist")
 if os.path.exists(dist_path) and os.path.isdir(dist_path):
-    # React 빌드 결과물 정적 파일 서빙
     app.mount(
         "/assets",
         StaticFiles(directory=os.path.join(dist_path, "assets")),
@@ -495,17 +489,13 @@ else:
 # ============================================================
 
 if __name__ == "__main__":
-    # Windows에서 multiprocessing 관련 에러 방지
     multiprocessing.freeze_support()
-    
-    # 포트 설정
     port = int(os.getenv("PORT", "8000"))
     
-    # Uvicorn 서버 실행
     uvicorn.run(
         app,
         host="0.0.0.0",
         port=port,
-        reload=False,  # 프로덕션 모드에서는 reload 비활성화
+        reload=False,
         log_level="info",
     )

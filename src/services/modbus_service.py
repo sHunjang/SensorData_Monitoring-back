@@ -1,12 +1,15 @@
 """
 Modbus(전력량계) 서비스 모듈
 
+
 주요 기능:
 - 시간 해상도별 데이터 조회 (1일/1주/1달/1년)
 - 3상 4선식 / 3상 3선식 자동 구분
 - 실시간 데이터 조회 (원시 데이터 우선, 1분 집계 fallback)
 - 오늘 누적 에너지 계산
 - **커스텀 시간 범위 지원 (ISO 8601 형식: .000Z 포함)**
+- **총 누적 전력량 그래프 지원 (energy_end_kwh) - 모든 해상도**
+
 
 데이터 소스:
 - 실시간: modbus_data (원시 데이터) → modbus_*wire_1min (fallback)
@@ -14,6 +17,7 @@ Modbus(전력량계) 서비스 모듈
 - 1주 그래프: modbus_*wire_15min (15분 집계)
 - 1달 그래프: modbus_*wire_1hour (1시간 집계)
 - 1년 그래프: modbus_*wire_1day (1일 집계)
+
 
 *** 최종 수정 사항 ***
 ✅ ISO 8601 파싱 개선: .000Z, Z, +09:00 모두 지원
@@ -25,30 +29,38 @@ Modbus(전력량계) 서비스 모듈
 ✅ 피크 전력 지원: 15분 이후 해상도에서 피크 전력 제공
 ✅ 에너지 delta: 구간별 소비량 제공 (energy_delta_kwh)
 ✅ 통계 함수 추가: get_device_statistics() - 최근 N일 통계
+✅ 총 누적 전력량 추가: energy_end_kwh → total_energy (모든 해상도 지원!)
 """
+
 
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, timedelta, time
 from zoneinfo import ZoneInfo
 
+
 from src.db.client import get_cursor
 from src.config.settings import settings
 
+
 KST = ZoneInfo("Asia/Seoul")
+
 
 
 # ============================================================
 # 헬퍼 함수
 # ============================================================
 
+
 def _is_4wire(device_id: int) -> bool:
     """디바이스가 3상 4선식인지 확인"""
     return settings.is_4wire_device(device_id)
 
 
+
 def _is_3wire(device_id: int) -> bool:
     """디바이스가 3상 3선식인지 확인"""
     return settings.is_3wire_device(device_id)
+
 
 
 def _get_table_and_columns(device_id: int, resolution: str) -> tuple:
@@ -73,6 +85,7 @@ def _get_table_and_columns(device_id: int, resolution: str) -> tuple:
     energy_available = True
     
     return table_name, voltage_col, energy_available
+
 
 
 def _parse_iso_datetime(iso_str: str) -> datetime:
@@ -113,9 +126,11 @@ def _parse_iso_datetime(iso_str: str) -> datetime:
     return dt
 
 
+
 # ============================================================
 # 시간 범위 및 해상도 결정
 # ============================================================
+
 
 def _determine_resolution_and_range(
     preset: Optional[str],
@@ -221,9 +236,11 @@ def _determine_resolution_and_range(
     return start_dt, end_dt, resolution
 
 
+
 # ============================================================
 # 메인 조회 함수
 # ============================================================
+
 
 def query_modbus_data(
     device_id: int,
@@ -234,6 +251,8 @@ def query_modbus_data(
 ) -> Dict[str, Any]:
     """
     Modbus 데이터 조회 (시간 해상도 자동 선택)
+    
+    ✅ 수정: 모든 해상도에서 total_energy 지원
     """
     start_dt, end_dt, resolution = _determine_resolution_and_range(preset, start, end)
     table_name, voltage_col, energy_available = _get_table_and_columns(device_id, resolution)
@@ -249,7 +268,8 @@ def query_modbus_data(
                 avg_reactive_power_kvar AS reactive_power,
                 avg_apparent_power_kva AS apparent_power,
                 avg_power_factor AS power_factor,
-                data_points
+                data_points,
+                energy_end_kwh AS total_energy
             FROM {table_name}
             WHERE device_id = %s
               AND bucket >= %s
@@ -258,6 +278,7 @@ def query_modbus_data(
             LIMIT %s;
         """
     else:
+        # ✅ 수정: 15분/1시간/1일도 energy_end_kwh 조회
         sql = f"""
             SELECT
                 bucket,
@@ -269,7 +290,8 @@ def query_modbus_data(
                 NULL AS reactive_power,
                 NULL AS apparent_power,
                 NULL AS power_factor,
-                data_points
+                data_points,
+                energy_end_kwh AS total_energy
             FROM {table_name}
             WHERE device_id = %s
               AND bucket >= %s
@@ -300,10 +322,11 @@ def query_modbus_data(
             item["reactive_power"] = round(row[5], 2) if row[5] is not None else None
             item["apparent_power"] = round(row[6], 2) if row[6] is not None else None
             item["power_factor"] = round(row[7], 3) if row[7] is not None else None
-        
-        
-        if resolution != "1min" and len(row) > 5:
+            item["total_energy"] = round(row[9], 3) if row[9] is not None else None
+        else:
+            # ✅ 15분 이상도 total_energy 추가
             item["peak_power"] = round(row[5], 2) if row[5] is not None else None
+            item["total_energy"] = round(row[10], 3) if row[10] is not None else None
         
         data.append(item)
     
@@ -318,9 +341,11 @@ def query_modbus_data(
     }
 
 
+
 # ============================================================
 # 실시간 데이터 조회 (✅ 수정: fallback 추가)
 # ============================================================
+
 
 def query_modbus_realtime(device_id: int) -> Optional[Dict[str, Any]]:
     """
@@ -422,9 +447,11 @@ def query_modbus_realtime(device_id: int) -> Optional[Dict[str, Any]]:
 
 
 
+
 # ============================================================
 # 오늘 누적 에너지 계산
 # ============================================================
+
 
 def get_today_energy_kwh(device_id: int) -> Optional[float]:
     """
@@ -432,29 +459,28 @@ def get_today_energy_kwh(device_id: int) -> Optional[float]:
     """
     now_kst = datetime.now(KST)
     today_start = datetime.combine(now_kst.date(), time(0, 0, 0), tzinfo=KST)
-    
+    tomorrow_start = today_start + timedelta(days=1)
     wire_type = "4wire" if _is_4wire(device_id) else "3wire"
     
-    # 1차 시도: 1분 집계 테이블
+    # 1차 시도: 1분 집계 테이블에서 오늘 데이터 합산
     table_1min = f"modbus_{wire_type}_1min"
-    sql_1day = f"""
-        SELECT energy_delta_kwh
+    sql_1min = f"""
+        SELECT SUM(energy_delta_kwh)
         FROM {table_1min}
         WHERE device_id = %s
-          AND bucket = %s
-        LIMIT 1;
+          AND bucket >= %s
+          AND bucket < %s;
     """
     
     with get_cursor() as cur:
-        cur.execute(sql_1day, (device_id, today_start))
+        cur.execute(sql_1min, (device_id, today_start, tomorrow_start))
         row = cur.fetchone()
         if row and row[0] is not None:
             return round(float(row[0]), 3)
     
     # 2차 시도: 15분 집계 테이블 합산
     table_15min = f"modbus_{wire_type}_15min"
-    tomorrow_start = today_start + timedelta(days=1)
-    sql_1hour = f"""
+    sql_15min = f"""
         SELECT SUM(energy_delta_kwh)
         FROM {table_15min}
         WHERE device_id = %s
@@ -463,7 +489,7 @@ def get_today_energy_kwh(device_id: int) -> Optional[float]:
     """
     
     with get_cursor() as cur:
-        cur.execute(sql_1hour, (device_id, today_start, tomorrow_start))
+        cur.execute(sql_15min, (device_id, today_start, tomorrow_start))
         row = cur.fetchone()
         if row and row[0] is not None:
             return round(float(row[0]), 3)
@@ -471,9 +497,11 @@ def get_today_energy_kwh(device_id: int) -> Optional[float]:
     return None
 
 
+
 # ============================================================
 # 통계 계산
 # ============================================================
+
 
 def get_device_statistics(device_id: int, days: int = 7) -> Dict[str, Any]:
     """
@@ -514,3 +542,51 @@ def get_device_statistics(device_id: int, days: int = 7) -> Dict[str, Any]:
         "peak_power_kw": round(float(row[2]), 2) if row[2] else 0.0,
         "period_days": days,
     }
+
+
+def get_total_energy(device_id: int) -> Dict[str, Any]:
+    """
+    총 누적 전력량 조회 (전력량계 시작부터 현재까지)
+    modbus_data 테이블에서 최신 total_active_energy_kwh 값 반환
+    """
+    with get_cursor() as cur:
+        # 최신 total_active_energy_kwh 값 조회
+        cur.execute("""
+            SELECT 
+                time_stamp,
+                total_active_energy_kwh,
+                total_reactive_energy_kvarh,
+                total_apparent_energy_kvah
+            FROM modbus_data
+            WHERE device_id = %s
+            ORDER BY time_stamp DESC
+            LIMIT 1
+        """, (device_id,))
+        
+        row = cur.fetchone()
+        
+        if row:
+            time_stamp, total_active, total_reactive, total_apparent = row
+            
+            # 타임존 처리
+            if time_stamp.tzinfo is None:
+                time_stamp = time_stamp.replace(tzinfo=KST)
+            
+            return {
+                "device_id": device_id,
+                "time_stamp": time_stamp.isoformat(),
+                "total_active_energy_kwh": round(float(total_active), 3) if total_active else 0.0,
+                "total_reactive_energy_kvarh": round(float(total_reactive), 3) if total_reactive else 0.0,
+                "total_apparent_energy_kvah": round(float(total_apparent), 3) if total_apparent else 0.0,
+                "wire_type": "4wire" if _is_4wire(device_id) else "3wire"
+            }
+        else:
+            # 데이터가 없는 경우
+            return {
+                "device_id": device_id,
+                "time_stamp": None,
+                "total_active_energy_kwh": 0.0,
+                "total_reactive_energy_kvarh": 0.0,
+                "total_apparent_energy_kvah": 0.0,
+                "wire_type": "4wire" if _is_4wire(device_id) else "3wire"
+            }

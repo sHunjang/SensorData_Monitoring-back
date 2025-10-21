@@ -204,3 +204,10 @@ def update_register_map(new_map):
     global REGISTER_MAP
     REGISTER_MAP = new_map.copy()
     log.info("REGISTER_MAP updated: %s", list(REGISTER_MAP.keys()))
+
+def read_modbus_sensor(inst: ModbusInstrument) -> Dict[str, float]:
+    """
+    TAC4300 전력량계 데이터 읽기 (modbus_collector.py 호환용)
+    내부적으로 read_summary() 호출
+    """
+    return read_summary(inst)

@@ -1,144 +1,167 @@
+# src/collectors/modbus_collector.py
 """
-데이터베이스 스키마 초기화 모듈
-
-주요 기능:
-- PostgreSQL 데이터베이스 스키마 생성
-- 모든 테이블과 인덱스 초기화
-- TimescaleDB 지원 (선택적)
-- Idempotent 실행 (중복 실행 안전)
-- ✅ 기존 데이터 보존 (migrate_data => TRUE)
-
-테이블 구조:
-- modbus_data: 전력 데이터 (TAC4300)
-- env_data: 환경 데이터 (온도, 습도)
-- solar_data: 태양광 데이터 (일사량) - irradiance 컬럼 사용
-
-사용법:
-python -m src.db.bootstrap
+Modbus(전력량계) 수집기 - TAC4300 통신
 """
 
-import os
+import time
 import logging
-import psycopg2
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from typing import Dict
 
-# 로깅 설정
-log = logging.getLogger("bootstrap")
-log.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-log.addHandler(handler)
+from src.config.settings import settings
+from src.db.client import get_cursor
+from src.sensors.modbus_reader import create_instrument, read_modbus_sensor
+from src.collectors.serial_manager import SerialPortManager
 
+log = logging.getLogger("modbus_collector")
+KST = ZoneInfo("Asia/Seoul")
 
-# 🎯 통일된 스키마 DDL - irradiance 컬럼 사용
-DDL_BASE = r"""
--- modbus_data 테이블 (전력 데이터)
-CREATE TABLE IF NOT EXISTS modbus_data (
-    time_stamp TIMESTAMPTZ NOT NULL,
-    device_id INT NOT NULL,
-    avg_line_to_line_volts_v DOUBLE PRECISION,
-    avg_line_to_neutral_volts_v DOUBLE PRECISION,
-    sum_line_currents_a DOUBLE PRECISION,
-    total_active_power_kw DOUBLE PRECISION,
-    total_reactive_power_kvar DOUBLE PRECISION,
-    total_apparent_power_kva DOUBLE PRECISION,
-    total_power_factor DOUBLE PRECISION,
-    total_active_energy_kwh DOUBLE PRECISION,
-    total_reactive_energy_kvarh DOUBLE PRECISION,
-    total_apparent_energy_kvah DOUBLE PRECISION
-);
+def ensure_table():
+    """
+    TimescaleDB 하이퍼테이블 생성 (기존 데이터 보존)
+    """
+    with get_cursor() as cur:
+        # 1. 원본 테이블
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS modbus_data (
+                time_stamp TIMESTAMPTZ NOT NULL,
+                device_id INT NOT NULL,
+                avg_line_to_line_volts_v DOUBLE PRECISION,
+                avg_line_to_neutral_volts_v DOUBLE PRECISION,
+                sum_line_currents_a DOUBLE PRECISION,
+                total_active_power_kw DOUBLE PRECISION,
+                total_reactive_power_kvar DOUBLE PRECISION,
+                total_apparent_power_kva DOUBLE PRECISION,
+                total_power_factor DOUBLE PRECISION,
+                total_active_energy_kwh DOUBLE PRECISION,
+                total_reactive_energy_kvarh DOUBLE PRECISION,
+                total_apparent_energy_kvah DOUBLE PRECISION
+            );
+        """)
+        
+        # 2. 하이퍼테이블 변환
+        try:
+            cur.execute("""
+                SELECT create_hypertable(
+                    'modbus_data',
+                    'time_stamp',
+                    if_not_exists => TRUE,
+                    migrate_data => TRUE,
+                    chunk_time_interval => INTERVAL '7 days'
+                );
+            """)
+            log.info("✅ modbus_data 하이퍼테이블 변환 완료 (기존 데이터 보존)")
+        except Exception as e:
+            log.info(f"✅ modbus_data 이미 하이퍼테이블로 존재함")
+        
+        # 3. 인덱스
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_modbus_device_time
+            ON modbus_data (device_id, time_stamp DESC);
+        """)
+    
+    log.info("✅ TimescaleDB 하이퍼테이블 준비 완료 (modbus)")
 
--- modbus_data 인덱스
-CREATE INDEX IF NOT EXISTS idx_modbus_device_time ON modbus_data(device_id, time_stamp DESC);
-
--- env_data 테이블 (환경 데이터)
-CREATE TABLE IF NOT EXISTS env_data (
-    time_stamp TIMESTAMPTZ NOT NULL,
-    device_id INT NOT NULL,
-    temperature DOUBLE PRECISION,
-    humidity DOUBLE PRECISION
-);
-
--- env_data 인덱스
-CREATE INDEX IF NOT EXISTS idx_env_device_time ON env_data(device_id, time_stamp DESC);
-
--- ✅ solar_data 테이블 (일사량 데이터) - irradiance 컬럼 통일
-CREATE TABLE IF NOT EXISTS solar_data (
-    time_stamp TIMESTAMPTZ NOT NULL,
-    device_id INT NOT NULL,
-    irradiance DOUBLE PRECISION  -- 일사량 (W/m²)
-);
-
--- solar_data 인덱스
-CREATE INDEX IF NOT EXISTS idx_solar_device_time ON solar_data(device_id, time_stamp DESC);
-"""
-
-
-# ✅ TimescaleDB hypertable 설정 (migrate_data => TRUE 추가)
-DDL_TIMESCALEDB = r"""
--- ✅ TimescaleDB hypertable 생성 (기존 데이터 보존)
-SELECT create_hypertable('modbus_data', 'time_stamp', 
-    if_not_exists => TRUE, 
-    migrate_data => TRUE,
-    chunk_time_interval => INTERVAL '7 days'
-);
-
-SELECT create_hypertable('env_data', 'time_stamp', 
-    if_not_exists => TRUE, 
-    migrate_data => TRUE,
-    chunk_time_interval => INTERVAL '7 days'
-);
-
-SELECT create_hypertable('solar_data', 'time_stamp', 
-    if_not_exists => TRUE, 
-    migrate_data => TRUE,
-    chunk_time_interval => INTERVAL '7 days'
-);
-"""
-
-
-def ensure_schema():
-    """스키마 초기화 - 모든 테이블과 인덱스 생성 (기존 데이터 보존)"""
-    dsn = os.getenv("PG_DSN", "postgresql://postgres:1234@127.0.0.1:5432/energydb")
-    log.info("🔌 ensure_schema: connecting to DB")
+def insert_row(device_id: int, payload: Dict[str, float]):
+    """DB 삽입"""
+    now_kst = datetime.now(KST)
     
     try:
-        conn = psycopg2.connect(dsn)
-        conn.autocommit = True
-        
-        log.info("✅ ensure_schema: creating base tables and indexes (if not exists)")
-        with conn.cursor() as cur:
-            cur.execute(DDL_BASE)
-        log.info("✅ Base tables created successfully")
-        
-        # TimescaleDB 확장 확인 및 hypertable 생성
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM pg_extension WHERE extname = 'timescaledb'")
-                if cur.fetchone():
-                    log.info("📊 ensure_schema: timescaledb installed, ensuring hypertables (migrate_data=TRUE)")
-                    cur.execute(DDL_TIMESCALEDB)
-                    log.info("✅ TimescaleDB hypertables created successfully (기존 데이터 보존)")
-                else:
-                    log.warning("⚠️ TimescaleDB extension not found. Run: CREATE EXTENSION timescaledb;")
-        except Exception as e:
-            log.warning("⚠️ TimescaleDB setup skipped: %s", e)
-        
-        # 테이블 목록 확인
-        with conn.cursor() as cur:
+        with get_cursor() as cur:
             cur.execute("""
-                SELECT table_name FROM information_schema.tables 
-                WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
-                ORDER BY table_name
-            """)
-            tables = [row[0] for row in cur.fetchall()]
-            log.info("✅ Schema initialization complete! Tables: %s", tables)
-        
-        conn.close()
-        
-    except Exception as e:
-        log.exception("❌ Schema initialization failed")
-        raise
+                INSERT INTO modbus_data (
+                    time_stamp, device_id,
+                    avg_line_to_line_volts_v, avg_line_to_neutral_volts_v,
+                    sum_line_currents_a, total_active_power_kw,
+                    total_reactive_power_kvar, total_apparent_power_kva,
+                    total_power_factor, total_active_energy_kwh,
+                    total_reactive_energy_kvarh, total_apparent_energy_kvah
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                now_kst, device_id,
+                payload.get("avg_line_to_line_volts_v"),
+                payload.get("avg_line_to_neutral_volts_v"),
+                payload.get("sum_line_currents_a"),
+                payload.get("total_active_power_kw"),
+                payload.get("total_reactive_power_kvar"),
+                payload.get("total_apparent_power_kva"),
+                payload.get("total_power_factor"),
+                payload.get("total_active_energy_kwh"),
+                payload.get("total_reactive_energy_kvarh"),
+                payload.get("total_apparent_energy_kvah")
+            ))
+            log.debug("⚡ modbus: device=%s power=%.2f kW",
+                      device_id, payload.get("total_active_power_kw", 0))
+    except Exception:
+        log.exception("❌ DB insert failed for device=%s", device_id)
 
+def run_once_for_device(device_id: int, fail_counts: dict, serial_mgr: SerialPortManager):
+    """단일 장치 읽기 - Thread-safe"""
+    port = settings.MODBUS_PORT
+    baud = settings.MODBUS_BAUDRATE
+    
+    def read_operation():
+        """시리얼 포트 작업"""
+        inst = create_instrument(port=port, slave_id=device_id, baudrate=baud)
+        try:
+            data = read_modbus_sensor(inst)
+            if not isinstance(data, dict):
+                raise RuntimeError(f"read_modbus_sensor returned non-dict: {data}")
+            insert_row(device_id, data)
+            return True
+        finally:
+            if hasattr(inst, 'serial') and inst.serial:
+                inst.serial.close()
+    
+    try:
+        result = serial_mgr.execute(read_operation)
+        if result:
+            fail_counts[device_id] = 0
+        else:
+            raise RuntimeError("Read operation returned None")
+    except Exception as e:
+        fail_counts[device_id] = fail_counts.get(device_id, 0) + 1
+        log.warning("⚠️ modbus read fail device=%s count=%s err=%s",
+                    device_id, fail_counts[device_id], e)
+
+def main():
+    """메인 루프"""
+    log.info("⚡ modbus_collector starting...")
+    ensure_table()
+    
+    device_ids = getattr(settings, "MODBUS_DEVICE_IDS", [11, 12, 13, 14, 15])
+    interval = getattr(settings, "MODBUS_POLL_INTERVAL", 5)
+    max_fails = 5
+    
+    if not device_ids:
+        log.warning("⚠️ MODBUS_DEVICE_IDS가 비어있음")
+        return
+    
+    port = settings.MODBUS_PORT
+    log.info("📡 modbus config: port=%s devices=%s interval=%ss",
+             port, device_ids, interval)
+    
+    # ✅ Serial Manager 가져오기
+    serial_mgr = SerialPortManager.get_instance(port)
+    fail_counts = {mid: 0 for mid in device_ids}
+    
+    while True:
+        for mid in device_ids:
+            if fail_counts.get(mid, 0) >= max_fails:
+                if fail_counts.get(mid, 0) == max_fails:
+                    log.error("🚫 device %s disabled", mid)
+                    fail_counts[mid] = max_fails + 1
+                continue
+            
+            run_once_for_device(mid, fail_counts, serial_mgr)
+        
+        time.sleep(interval)
 
 if __name__ == "__main__":
-    ensure_schema()
+    try:
+        main()
+    except KeyboardInterrupt:
+        log.info("🛑 modbus_collector stopped")
+    except Exception as e:
+        log.exception("❌ modbus_collector crashed: %s", e)

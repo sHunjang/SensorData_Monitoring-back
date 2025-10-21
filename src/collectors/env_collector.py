@@ -1,10 +1,7 @@
 # src/collectors/env_collector.py
-
-
 """
 환경센서(온도·습도) 수집기 - TimescaleDB 연동
 """
-
 
 import time
 import logging
@@ -12,16 +9,13 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Dict
 
-
 from src.config.settings import settings
 from src.db.client import get_cursor
 from src.sensors.env_reader import create_instrument, read_env_sensor
-
+from src.collectors.serial_manager import SerialPortManager  # ✅ 추가
 
 log = logging.getLogger("env_collector")
 KST = ZoneInfo("Asia/Seoul")
-
-
 
 def ensure_table():
     """
@@ -42,7 +36,7 @@ def ensure_table():
         try:
             cur.execute("""
                 SELECT create_hypertable(
-                    'env_data', 
+                    'env_data',
                     'time_stamp',
                     if_not_exists => TRUE,
                     migrate_data => TRUE,
@@ -55,7 +49,7 @@ def ensure_table():
         
         # 3. 인덱스
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_env_device_time 
+            CREATE INDEX IF NOT EXISTS idx_env_device_time
             ON env_data (device_id, time_stamp DESC);
         """)
         
@@ -95,10 +89,8 @@ def ensure_table():
                 """)
             except Exception as e:
                 log.debug(f"⚠️ Policy for env_data_{interval_name}: {e}")
-        
-        log.info("✅ TimescaleDB 하이퍼테이블 및 연속 집계 준비 완료 (env)")
-
-
+    
+    log.info("✅ TimescaleDB 하이퍼테이블 및 연속 집계 준비 완료 (env)")
 
 def insert_row(device_id: int, payload: Dict[str, float]):
     """DB 삽입"""
@@ -112,38 +104,39 @@ def insert_row(device_id: int, payload: Dict[str, float]):
                 INSERT INTO env_data (time_stamp, device_id, temperature, humidity)
                 VALUES (%s, %s, %s, %s)
             """, (now_kst, device_id, temp, humi))
-            
-            log.debug("🌡️ env: device=%s temp=%.1f°C humi=%.1f%%", 
-                     device_id, temp or 0, humi or 0)
+            log.debug("🌡️ env: device=%s temp=%.1f°C humi=%.1f%%",
+                      device_id, temp or 0, humi or 0)
     except Exception:
         log.exception("❌ DB insert failed for device=%s", device_id)
 
-
-
-def run_once_for_device(device_id: int, fail_counts: dict):
-    """단일 장치 읽기"""
+def run_once_for_device(device_id: int, fail_counts: dict, serial_mgr: SerialPortManager):
+    """단일 장치 읽기 - Thread-safe"""
     port = settings.ENV_PORT
     baud = settings.ENV_BAUDRATE
     
-    try:
+    def read_operation():
+        """시리얼 포트 작업"""
         inst = create_instrument(port=port, slave_id=device_id, baudrate=baud)
-        data = read_env_sensor(inst)
-        
-        if not isinstance(data, dict):
-            raise RuntimeError(f"read_env_sensor returned non-dict: {data}")
-        
-        insert_row(device_id, data)
-        fail_counts[device_id] = 0
-        
-        if hasattr(inst, 'serial') and inst.serial:
-            inst.serial.close()
-            
+        try:
+            data = read_env_sensor(inst)
+            if not isinstance(data, dict):
+                raise RuntimeError(f"read_env_sensor returned non-dict: {data}")
+            insert_row(device_id, data)
+            return True
+        finally:
+            if hasattr(inst, 'serial') and inst.serial:
+                inst.serial.close()
+    
+    try:
+        result = serial_mgr.execute(read_operation)
+        if result:
+            fail_counts[device_id] = 0
+        else:
+            raise RuntimeError("Read operation returned None")
     except Exception as e:
         fail_counts[device_id] = fail_counts.get(device_id, 0) + 1
-        log.warning("⚠️ env read fail device=%s count=%s err=%s", 
-                   device_id, fail_counts[device_id], e)
-
-
+        log.warning("⚠️ env read fail device=%s count=%s err=%s",
+                    device_id, fail_counts[device_id], e)
 
 def main():
     """메인 루프"""
@@ -158,9 +151,12 @@ def main():
         log.warning("⚠️ ENV_DEVICE_IDS가 비어있음")
         return
     
+    port = settings.ENV_PORT
     log.info("📡 env config: port=%s devices=%s interval=%ss",
-            settings.ENV_PORT, device_ids, interval)
+             port, device_ids, interval)
     
+    # ✅ Serial Manager 가져오기
+    serial_mgr = SerialPortManager.get_instance(port)
     fail_counts = {sid: 0 for sid in device_ids}
     
     while True:
@@ -171,11 +167,9 @@ def main():
                     fail_counts[sid] = max_fails + 1
                 continue
             
-            run_once_for_device(sid, fail_counts)
+            run_once_for_device(sid, fail_counts, serial_mgr)  # ✅ serial_mgr 전달
         
         time.sleep(interval)
-
-
 
 if __name__ == "__main__":
     try:
