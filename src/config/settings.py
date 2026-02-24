@@ -124,7 +124,7 @@ class Settings:
     # 📌 3상 4선식 전력계 (Line-to-Line 전압 측정)
     # bootstrap.py 스키마: modbus_4wire_*
     # 기본값: [11, 12, 13]
-    MODBUS_4W_IDS: List[int] = _parse_list_int("MODBUS_4W_IDS", [11, 12, 13])
+    MODBUS_4W_IDS: List[int] = _parse_list_int("MODBUS_4W_IDS", [11, 12, 13, 16, 17])
     
     # 📌 3상 3선식 전력계 (Line-to-Neutral 전압 측정)
     # bootstrap.py 스키마: modbus_3wire_*

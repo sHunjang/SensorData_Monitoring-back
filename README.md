@@ -89,7 +89,7 @@ uvicorn src.main:app --reload
 
 ### Modbus (전력량계)
 
-```http
+```bash
 GET /api/modbus/{device_id}/realtime          # 실시간 데이터
 GET /api/modbus/{device_id}/query             # 히스토리 데이터
 GET /api/modbus/{device_id}/today-energy      # 오늘 누적 전력량
@@ -101,7 +101,7 @@ GET /api/modbus/{device_id}/today-energy      # 오늘 누적 전력량
 
 ### 환경센서 / 일사량센서
 
-```http
+```bash
 GET /api/env/{device_id}/realtime
 GET /api/env/{device_id}/query
 GET /api/solar/{device_id}/realtime
@@ -112,7 +112,7 @@ GET /api/solar/{device_id}/query
 
 ## 📁 프로젝트 구조
 
-```
+```bash
 backend/
 ├── src/
 │   ├── main.py              # FastAPI 앱
@@ -132,7 +132,7 @@ backend/
 
 ## 🔧 주요 의존성
 
-```txt
+```bash
 fastapi==0.118.0
 uvicorn==0.37.0
 psycopg2-binary==2.9.8

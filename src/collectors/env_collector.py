@@ -12,7 +12,7 @@ from typing import Dict
 from src.config.settings import settings
 from src.db.client import get_cursor
 from src.sensors.env_reader import create_instrument, read_env_sensor
-from src.collectors.serial_manager import SerialPortManager  # ✅ 추가
+from src.collectors.serial_manager import SerialPortManager  # 추가
 
 log = logging.getLogger("env_collector")
 KST = ZoneInfo("Asia/Seoul")
@@ -32,7 +32,7 @@ def ensure_table():
             );
         """)
         
-        # 2. 하이퍼테이블 변환 (✅ migrate_data => TRUE 추가)
+        # 2. 하이퍼테이블 변환 (migrate_data => TRUE 추가)
         try:
             cur.execute("""
                 SELECT create_hypertable(
@@ -43,9 +43,9 @@ def ensure_table():
                     chunk_time_interval => INTERVAL '7 days'
                 );
             """)
-            log.info("✅ env_data 하이퍼테이블 변환 완료 (기존 데이터 보존)")
+            log.info("env_data 하이퍼테이블 변환 완료 (기존 데이터 보존)")
         except Exception as e:
-            log.info(f"✅ env_data 이미 하이퍼테이블로 존재함")
+            log.info(f"env_data 이미 하이퍼테이블로 존재함")
         
         # 3. 인덱스
         cur.execute("""
@@ -73,7 +73,7 @@ def ensure_table():
                     GROUP BY bucket, device_id
                     WITH NO DATA;
                 """)
-                log.info(f"✅ env_data_{interval_name} 연속 집계 생성 완료")
+                log.info(f"env_data_{interval_name} 연속 집계 생성 완료")
             except Exception as e:
                 log.debug(f"env_data_{interval_name} 이미 존재: {e}")
             
@@ -90,7 +90,7 @@ def ensure_table():
             except Exception as e:
                 log.debug(f"⚠️ Policy for env_data_{interval_name}: {e}")
     
-    log.info("✅ TimescaleDB 하이퍼테이블 및 연속 집계 준비 완료 (env)")
+    log.info("TimescaleDB 하이퍼테이블 및 연속 집계 준비 완료 (env)")
 
 def insert_row(device_id: int, payload: Dict[str, float]):
     """DB 삽입"""
@@ -155,7 +155,7 @@ def main():
     log.info("📡 env config: port=%s devices=%s interval=%ss",
              port, device_ids, interval)
     
-    # ✅ Serial Manager 가져오기
+    # Serial Manager 가져오기
     serial_mgr = SerialPortManager.get_instance(port)
     fail_counts = {sid: 0 for sid in device_ids}
     
@@ -167,7 +167,7 @@ def main():
                     fail_counts[sid] = max_fails + 1
                 continue
             
-            run_once_for_device(sid, fail_counts, serial_mgr)  # ✅ serial_mgr 전달
+            run_once_for_device(sid, fail_counts, serial_mgr)  # serial_mgr 전달
         
         time.sleep(interval)
 
